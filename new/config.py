@@ -36,10 +36,11 @@ MAX_EDGE_ANGLE_FROM_HORIZONTAL = 70  #degrees
 #model parameters
 INPUT_CHANNELS = 3
 INPUT_FRAMES = 15
-BATCH_SIZE = 8
-LEARNING_RATE = 1e-4
+BATCH_SIZE = 16          #increased for more stable gradients
+LEARNING_RATE = 5e-5     #reduced for stability with focal loss
 NUM_EPOCHS = 10
 TRAIN_VAL_SPLIT = 0.8
+GRAD_CLIP = 1.0          #gradient clipping for stability
 
 #detection parameters
 DETECTION_THRESHOLD = 0.7  #confidence threshold for detection
@@ -47,9 +48,9 @@ DETECTION_THRESHOLD = 0.7  #confidence threshold for detection
 #spikey loss parameters (for better peak detection)
 FOCAL_ALPHA = 0.25     #positive class weight in focal loss
 FOCAL_GAMMA = 2.0      #focus on hard examples (higher = more focus)
-MARGIN_WEIGHT = 0.3    #weight for confidence margin loss
-POS_TARGET = 0.9       #target probability for bump frames
-NEG_TARGET = 0.1       #target probability for non-bump frames
+MARGIN_WEIGHT = 0.2    #weight for confidence margin loss (lower = more stable)
+POS_TARGET = 0.85      #target probability for bump frames
+NEG_TARGET = 0.15      #target probability for non-bump frames
 
 #create directories
 for d in [OUTPUT_DIR, MODEL_DIR, TRAINING_DATA_DIR]:

@@ -135,8 +135,8 @@ class EarlyStopping:
             self.counter = 0
 
 
-def train_epoch(model, loader, criterion, optimizer, device):
-    """train for one epoch"""
+def train_epoch(model, loader, criterion, optimizer, device, grad_clip=None):
+    """train for one epoch with optional gradient clipping"""
     model.train()
     total_loss = 0
     all_preds = []
@@ -152,6 +152,11 @@ def train_epoch(model, loader, criterion, optimizer, device):
         loss = criterion(outputs, batch_y)
         
         loss.backward()
+        
+        # gradient clipping for stability
+        if grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        
         optimizer.step()
         
         total_loss += loss.item()
@@ -265,10 +270,12 @@ def train_model(model_type='simple', epochs=None, batch_size=None, lr=None):
                'val_f1': [], 'val_auc': []}
     best_val_loss = float('inf')
     
-    print(f"\nstarting training for {epochs} epochs...")
+    #gradient clipping value
+    grad_clip = getattr(config, 'GRAD_CLIP', 1.0)
+    print(f"\nstarting training for {epochs} epochs (grad_clip={grad_clip})...")
     
     for epoch in range(epochs):
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, grad_clip=grad_clip)
         val_metrics = evaluate(model, val_loader, criterion, device)
         
         scheduler.step(val_metrics['loss'])
