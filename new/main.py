@@ -150,18 +150,25 @@ def create_training_clips_from_data(frames, edge_frames, bump_frames,
 
 
 def run_pipeline(video_path, model_type='simple', epochs=None, 
-                max_frames=5000, from_checkpoint=None, fresh_start=False):
+                max_frames=5000, from_checkpoint=None, fresh_start=False,
+                scaled_video_path=None):
     """
     run complete bump detection pipeline with checkpoint support
     
     from_checkpoint: int or str - start from this checkpoint (0-6 or name)
     fresh_start: bool - ignore all checkpoints and start fresh
+    scaled_video_path: str - path to pre-scaled low-res video (skips scaling step)
     """
     epochs = epochs or config.NUM_EPOCHS
     
     print("="*60)
     print("BUMP DETECTION PIPELINE")
     print("="*60)
+    
+    #check if using pre-scaled video
+    use_prescaled = scaled_video_path is not None
+    if use_prescaled:
+        print(f"using pre-scaled video: {scaled_video_path}")
     
     #determine starting checkpoint
     start_step = 0
@@ -187,7 +194,7 @@ def run_pipeline(video_path, model_type='simple', epochs=None,
     
     #file paths
     gt_path = os.path.join(config.OUTPUT_DIR, "ground_truth.npy")
-    scaled_path = os.path.join(config.OUTPUT_DIR, "scaled_video.mp4")
+    scaled_path = scaled_video_path if use_prescaled else os.path.join(config.OUTPUT_DIR, "scaled_video.mp4")
     edges_path = os.path.join(config.OUTPUT_DIR, "edges.npy")
     feature_path = os.path.join(config.OUTPUT_DIR, "feature_map.mp4")
     overlay_path = os.path.join(config.OUTPUT_DIR, "edge_overlay.mp4")
@@ -211,7 +218,15 @@ def run_pipeline(video_path, model_type='simple', epochs=None,
         print(f"loaded {len(gt['bump_frames'])} bumps")
     
     #========== STEP 2: VIDEO SCALING ==========
-    if start_step <= 2:
+    if use_prescaled:
+        print("\n" + "="*60)
+        print("STEP 2: VIDEO SCALING (using pre-scaled video)")
+        print("="*60)
+        total_frames = get_frame_count(scaled_path)
+        print(f"pre-scaled video: {scaled_path}")
+        print(f"total frames: {total_frames}")
+        save_checkpoint(2, {'total_frames': total_frames})
+    elif start_step <= 2:
         print("\n" + "="*60)
         print("STEP 2: VIDEO SCALING")
         print("="*60)
@@ -340,7 +355,9 @@ def main():
     parser = argparse.ArgumentParser(description='Bump Detection Pipeline')
     parser.add_argument('--video', type=str, 
                        default=os.path.join(config.DATA_DIR, "PXL_20251118_131050616.TS.mp4"),
-                       help='path to input video')
+                       help='path to input video (used for audio ground truth)')
+    parser.add_argument('--scaled-video', type=str, default=None,
+                       help='path to pre-scaled low-res video (skips scaling step)')
     parser.add_argument('--model', type=str, default='simple',
                        choices=['unet', 'simple', 'attention'],
                        help='model architecture')
@@ -359,6 +376,10 @@ def main():
         print(f"error: video not found: {args.video}")
         return
     
+    if args.scaled_video and not os.path.exists(args.scaled_video):
+        print(f"error: scaled video not found: {args.scaled_video}")
+        return
+    
     #convert checkpoint arg
     from_cp = None
     if args.from_checkpoint:
@@ -373,7 +394,8 @@ def main():
         epochs=args.epochs,
         max_frames=args.max_frames,
         from_checkpoint=from_cp,
-        fresh_start=args.fresh
+        fresh_start=args.fresh,
+        scaled_video_path=args.scaled_video
     )
 
 
