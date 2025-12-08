@@ -22,7 +22,7 @@ ENERGY_THRESHOLD_PERCENTILE = 85  #percentile for bump energy threshold
 MIN_BUMP_DISTANCE_SEC = 0.3  #minimum time between bumps
 
 #training clip parameters
-FRAMES_BEFORE_BUMP = 5  #frames to look back before bump
+FRAMES_BEFORE_BUMP = 8  #frames to look back before bump (detect 8 frames before bump)
 CLIP_LENGTH = 15  #total frames per training clip
 MIN_FRAMES_TO_NEXT_BUMP = 30  #minimum frames to next bump for negative samples
 
@@ -38,8 +38,11 @@ INPUT_CHANNELS = 3
 INPUT_FRAMES = 15
 BATCH_SIZE = 8
 LEARNING_RATE = 1e-4
-NUM_EPOCHS = 5
+NUM_EPOCHS = 10
 TRAIN_VAL_SPLIT = 0.8
+
+#detection parameters
+DETECTION_THRESHOLD = 0.5  #confidence threshold for detection
 
 #create directories
 for d in [OUTPUT_DIR, MODEL_DIR, TRAINING_DATA_DIR]:

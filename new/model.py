@@ -9,23 +9,24 @@ import config
 
 
 class Conv3DBlock(nn.Module):
-    """3d convolution block with batchnorm and relu"""
-    def __init__(self, in_channels, out_channels, kernel_size=3, padding=1):
+    """3d convolution block with batchnorm, relu, and dropout"""
+    def __init__(self, in_channels, out_channels, kernel_size=3, padding=1, dropout=0.1):
         super().__init__()
         self.conv = nn.Conv3d(in_channels, out_channels, kernel_size, padding=padding)
         self.bn = nn.BatchNorm3d(out_channels)
         self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout3d(dropout)
     
     def forward(self, x):
-        return self.relu(self.bn(self.conv(x)))
+        return self.dropout(self.relu(self.bn(self.conv(x))))
 
 
 class EncoderBlock(nn.Module):
     """encoder block with two conv layers and pooling"""
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, dropout=0.1):
         super().__init__()
-        self.conv1 = Conv3DBlock(in_channels, out_channels)
-        self.conv2 = Conv3DBlock(out_channels, out_channels)
+        self.conv1 = Conv3DBlock(in_channels, out_channels, dropout=dropout)
+        self.conv2 = Conv3DBlock(out_channels, out_channels, dropout=dropout)
         self.pool = nn.MaxPool3d(kernel_size=2, stride=2)
     
     def forward(self, x):
@@ -36,12 +37,12 @@ class EncoderBlock(nn.Module):
 
 class DecoderBlock(nn.Module):
     """decoder block with upsampling and skip connection"""
-    def __init__(self, in_channels, skip_channels, out_channels):
+    def __init__(self, in_channels, skip_channels, out_channels, dropout=0.1):
         super().__init__()
         self.upsample = nn.ConvTranspose3d(in_channels, in_channels, 
                                            kernel_size=2, stride=2)
-        self.conv1 = Conv3DBlock(in_channels + skip_channels, out_channels)
-        self.conv2 = Conv3DBlock(out_channels, out_channels)
+        self.conv1 = Conv3DBlock(in_channels + skip_channels, out_channels, dropout=dropout)
+        self.conv2 = Conv3DBlock(out_channels, out_channels, dropout=dropout)
     
     def forward(self, x, skip):
         x = self.upsample(x)
@@ -65,26 +66,26 @@ class TemporalBumpDetector(nn.Module):
     input: (B, C, T, H, W) - batch, channels, time, height, width
     output: (B, 1) - bump probability
     """
-    def __init__(self, in_channels=3, base_filters=32):
+    def __init__(self, in_channels=3, base_filters=32, dropout=0.1):
         super().__init__()
         
         #encoder path
-        self.enc1 = EncoderBlock(in_channels, base_filters)
-        self.enc2 = EncoderBlock(base_filters, base_filters * 2)
-        self.enc3 = EncoderBlock(base_filters * 2, base_filters * 4)
-        self.enc4 = EncoderBlock(base_filters * 4, base_filters * 8)
+        self.enc1 = EncoderBlock(in_channels, base_filters, dropout=dropout)
+        self.enc2 = EncoderBlock(base_filters, base_filters * 2, dropout=dropout)
+        self.enc3 = EncoderBlock(base_filters * 2, base_filters * 4, dropout=dropout)
+        self.enc4 = EncoderBlock(base_filters * 4, base_filters * 8, dropout=dropout)
         
         #bottleneck
         self.bottleneck = nn.Sequential(
-            Conv3DBlock(base_filters * 8, base_filters * 16),
-            Conv3DBlock(base_filters * 16, base_filters * 16)
+            Conv3DBlock(base_filters * 8, base_filters * 16, dropout=dropout),
+            Conv3DBlock(base_filters * 16, base_filters * 16, dropout=dropout)
         )
         
         #decoder path with skip connections
-        self.dec4 = DecoderBlock(base_filters * 16, base_filters * 8, base_filters * 8)
-        self.dec3 = DecoderBlock(base_filters * 8, base_filters * 4, base_filters * 4)
-        self.dec2 = DecoderBlock(base_filters * 4, base_filters * 2, base_filters * 2)
-        self.dec1 = DecoderBlock(base_filters * 2, base_filters, base_filters)
+        self.dec4 = DecoderBlock(base_filters * 16, base_filters * 8, base_filters * 8, dropout=dropout)
+        self.dec3 = DecoderBlock(base_filters * 8, base_filters * 4, base_filters * 4, dropout=dropout)
+        self.dec2 = DecoderBlock(base_filters * 4, base_filters * 2, base_filters * 2, dropout=dropout)
+        self.dec1 = DecoderBlock(base_filters * 2, base_filters, base_filters, dropout=dropout)
         
         #global pooling and classification head
         self.global_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
@@ -125,7 +126,7 @@ class SimplerTemporalCNN(nn.Module):
     simpler 3d cnn without u-net decoder
     faster training for initial experiments
     """
-    def __init__(self, in_channels=3, base_filters=32):
+    def __init__(self, in_channels=3, base_filters=32, dropout=0.1):
         super().__init__()
         
         self.features = nn.Sequential(
@@ -133,24 +134,28 @@ class SimplerTemporalCNN(nn.Module):
             nn.Conv3d(in_channels, base_filters, kernel_size=3, padding=1),
             nn.BatchNorm3d(base_filters),
             nn.ReLU(inplace=True),
+            nn.Dropout3d(dropout),
             nn.MaxPool3d(kernel_size=2, stride=2),
             
             #block 2
             nn.Conv3d(base_filters, base_filters * 2, kernel_size=3, padding=1),
             nn.BatchNorm3d(base_filters * 2),
             nn.ReLU(inplace=True),
+            nn.Dropout3d(dropout),
             nn.MaxPool3d(kernel_size=2, stride=2),
             
             #block 3
             nn.Conv3d(base_filters * 2, base_filters * 4, kernel_size=3, padding=1),
             nn.BatchNorm3d(base_filters * 4),
             nn.ReLU(inplace=True),
+            nn.Dropout3d(dropout),
             nn.MaxPool3d(kernel_size=2, stride=2),
             
             #block 4
             nn.Conv3d(base_filters * 4, base_filters * 8, kernel_size=3, padding=1),
             nn.BatchNorm3d(base_filters * 8),
             nn.ReLU(inplace=True),
+            nn.Dropout3d(dropout),
             nn.AdaptiveAvgPool3d((1, 1, 1))
         )
         
@@ -174,24 +179,27 @@ class TemporalAttentionCNN(nn.Module):
     cnn with temporal attention mechanism
     learns to focus on relevant temporal regions
     """
-    def __init__(self, in_channels=3, base_filters=32):
+    def __init__(self, in_channels=3, base_filters=32, dropout=0.1):
         super().__init__()
         
-        #spatial feature extraction (2d conv per frame)
+        #spatial feature extraction (2d conv per frame) with dropout
         self.spatial_encoder = nn.Sequential(
             nn.Conv2d(in_channels, base_filters, kernel_size=3, padding=1),
             nn.BatchNorm2d(base_filters),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout),
             nn.MaxPool2d(2),
             
             nn.Conv2d(base_filters, base_filters * 2, kernel_size=3, padding=1),
             nn.BatchNorm2d(base_filters * 2),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout),
             nn.MaxPool2d(2),
             
             nn.Conv2d(base_filters * 2, base_filters * 4, kernel_size=3, padding=1),
             nn.BatchNorm2d(base_filters * 4),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout),
             nn.AdaptiveAvgPool2d((4, 4))
         )
         
@@ -199,15 +207,17 @@ class TemporalAttentionCNN(nn.Module):
         self.temporal_attention = nn.Sequential(
             nn.Linear(base_filters * 4 * 16, base_filters),
             nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
             nn.Linear(base_filters, 1),
             nn.Softmax(dim=1)
         )
         
-        #temporal fusion
+        #temporal fusion with 1d dropout (similar effect to 3d dropout)
         self.temporal_conv = nn.Sequential(
             nn.Conv1d(base_filters * 4 * 16, base_filters * 4, kernel_size=3, padding=1),
             nn.BatchNorm1d(base_filters * 4),
-            nn.ReLU(inplace=True)
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout)
         )
         
         self.classifier = nn.Sequential(
@@ -245,14 +255,14 @@ class TemporalAttentionCNN(nn.Module):
         return output.squeeze(-1)
 
 
-def get_model(model_type='unet', in_channels=3, base_filters=32):
+def get_model(model_type='unet', in_channels=3, base_filters=32, dropout=0.1):
     """factory function to get model by type"""
     if model_type == 'unet':
-        return TemporalBumpDetector(in_channels, base_filters)
+        return TemporalBumpDetector(in_channels, base_filters, dropout=dropout)
     elif model_type == 'simple':
-        return SimplerTemporalCNN(in_channels, base_filters)
+        return SimplerTemporalCNN(in_channels, base_filters, dropout=dropout)
     elif model_type == 'attention':
-        return TemporalAttentionCNN(in_channels, base_filters)
+        return TemporalAttentionCNN(in_channels, base_filters, dropout=dropout)
     else:
         raise ValueError(f"unknown model type: {model_type}")
 
@@ -285,4 +295,3 @@ if __name__ == "__main__":
         print(f"  input shape: {x.shape}")
         print(f"  output shape: {output.shape}")
         print(f"  output values: {output}")
-

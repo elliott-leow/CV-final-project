@@ -91,18 +91,17 @@ def sliding_window_inference(model, frames, edge_frames, device,
     return predictions
 
 
-def detect_bumps_from_predictions(predictions, threshold=0.5, min_distance=5):
+def detect_bumps_from_predictions(predictions, threshold=0.5):
     """
     convert frame-level predictions to bump detections
-    applies non-maximum suppression
+    simple thresholding - any frame above threshold is a detection
     """
-    from scipy.signal import find_peaks
+    #find all frames above threshold
+    above_threshold = predictions >= threshold
+    detected_frames = np.where(above_threshold)[0]
+    confidences = predictions[detected_frames]
     
-    #find peaks in predictions
-    peaks, properties = find_peaks(predictions, height=threshold, distance=min_distance)
-    confidences = properties['peak_heights']
-    
-    return peaks, confidences
+    return detected_frames, confidences
 
 
 def evaluate_detections(detected_frames, ground_truth_frames, 
@@ -156,7 +155,7 @@ def plot_detection_results(predictions, detected_frames, ground_truth_frames=Non
     
     #plot predictions
     axes[0].plot(time_axis, predictions, 'b-', alpha=0.7, label='bump probability')
-    axes[0].axhline(y=0.5, color='r', linestyle='--', alpha=0.5, label='threshold')
+    axes[0].axhline(y=0.5, color='r', linestyle='--', alpha=0.5, label='threshold (0.5)')
     axes[0].set_ylabel('probability')
     axes[0].legend()
     axes[0].set_title('bump detection predictions')

@@ -54,23 +54,58 @@ def load_checkpoint():
 
 
 def create_training_clips_from_data(frames, edge_frames, bump_frames,
-                                     frames_before=5, clip_length=15, 
-                                     min_frames_to_next=30):
-    """create training clips from processed data"""
+                                     frames_before=None, clip_length=None, 
+                                     min_frames_to_next=None):
+    """
+    create training clips from processed data
+    
+    positive labeling: any 15-frame window that includes the frame which is
+    'frames_before' frames ahead of the bump is marked positive.
+    this gives a wider range of positive samples around each bump.
+    """
+    frames_before = frames_before or config.FRAMES_BEFORE_BUMP
+    clip_length = clip_length or config.CLIP_LENGTH
+    min_frames_to_next = min_frames_to_next or config.MIN_FRAMES_TO_NEXT_BUMP
     total_frames = len(frames)
+    
+    print(f"  clip config: {frames_before} frames before bump, {clip_length} frame clips")
+    print(f"  positive window: any clip containing frame (bump - {frames_before})")
+    
+    #compute target frames (the frame 'frames_before' before each bump)
+    target_frames = set()
+    for bump_frame in bump_frames:
+        target = bump_frame - frames_before
+        if 0 <= target < total_frames:
+            target_frames.add(target)
+    
+    #find all valid positive clip start positions
+    #a clip starting at S covers frames S to S+(clip_length-1)
+    #for clip to contain target T: S <= T <= S+(clip_length-1)
+    #so: T-(clip_length-1) <= S <= T
+    positive_starts = set()
+    for target in target_frames:
+        min_start = max(0, target - (clip_length - 1))
+        max_start = min(target, total_frames - clip_length)
+        for s in range(min_start, max_start + 1):
+            positive_starts.add(s)
+    
+    print(f"  found {len(positive_starts)} valid positive clip positions")
     
     clips = []
     edge_clips = []
     labels = []
     
+    #sample positive clips (not all, to avoid too many duplicates)
     print("creating positive samples...")
-    for bump_frame in tqdm(bump_frames, desc="positive clips"):
-        start_frame = bump_frame - frames_before
+    positive_starts_list = sorted(list(positive_starts))
+    
+    #sample evenly from positive positions (take every Nth to limit count)
+    max_pos = min(len(positive_starts_list), len(bump_frames) * 3)
+    step = max(1, len(positive_starts_list) // max_pos)
+    sampled_pos = positive_starts_list[::step][:max_pos]
+    
+    for start_frame in tqdm(sampled_pos, desc="positive clips"):
         end_frame = start_frame + clip_length
-        
-        if start_frame < 0 or end_frame > total_frames:
-            continue
-        
         clips.append(frames[start_frame:end_frame])
         edge_clips.append(edge_frames[start_frame:end_frame])
         labels.append(1)
@@ -78,24 +113,25 @@ def create_training_clips_from_data(frames, edge_frames, bump_frames,
     num_pos = len(clips)
     print(f"  created {num_pos} positive clips")
     
+    #find negative samples (clips that don't overlap with any positive window)
     print("creating negative samples...")
-    bump_frames_sorted = np.sort(bump_frames)
-    
     negative_starts = []
     for frame_idx in range(0, total_frames - clip_length, 10):
-        end_frame = frame_idx + clip_length
-        
-        has_bump = np.any((bump_frames_sorted >= frame_idx) & (bump_frames_sorted < end_frame))
-        if has_bump:
+        #check if this clip overlaps with any positive window
+        if frame_idx in positive_starts:
             continue
         
-        future_bumps = bump_frames_sorted[bump_frames_sorted >= end_frame]
-        if len(future_bumps) > 0:
-            dist_to_next = future_bumps[0] - end_frame
-            if dist_to_next >= min_frames_to_next:
-                negative_starts.append(frame_idx)
-        else:
-            negative_starts.append(frame_idx)
+        #also check it doesn't contain any target frame
+        clip_end = frame_idx + clip_length - 1
+        is_positive = False
+        for target in target_frames:
+            if frame_idx <= target <= clip_end:
+                is_positive = True
+                break
+        if is_positive:
+            continue
+        
+        negative_starts.append(frame_idx)
     
     num_neg_needed = min(num_pos * 2, len(negative_starts))
     if len(negative_starts) > 0:

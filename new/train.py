@@ -215,6 +215,8 @@ def train_model(model_type='simple', epochs=None, batch_size=None, lr=None):
         
         if val_metrics['loss'] < best_val_loss:
             best_val_loss = val_metrics['loss']
+            
+            #save full checkpoint (for resuming training)
             save_path = os.path.join(config.MODEL_DIR, f'{model_type}_best.pth')
             torch.save({
                 'epoch': epoch,
@@ -222,6 +224,10 @@ def train_model(model_type='simple', epochs=None, batch_size=None, lr=None):
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_metrics': val_metrics,
             }, save_path)
+            
+            #save weights only (for inference)
+            weights_path = os.path.join(config.MODEL_DIR, f'{model_type}_weights.pth')
+            torch.save(model.state_dict(), weights_path)
         
         print(f"epoch {epoch+1}/{epochs} | "
               f"train_loss: {train_loss:.4f} | "
@@ -235,7 +241,7 @@ def train_model(model_type='simple', epochs=None, batch_size=None, lr=None):
             print(f"early stopping at epoch {epoch+1}")
             break
     
-    #save final model
+    #save final model (checkpoint)
     final_path = os.path.join(config.MODEL_DIR, f'{model_type}_final.pth')
     torch.save({
         'epoch': epoch,
@@ -243,7 +249,12 @@ def train_model(model_type='simple', epochs=None, batch_size=None, lr=None):
         'history': history,
     }, final_path)
     
+    #save final weights only
+    final_weights = os.path.join(config.MODEL_DIR, f'{model_type}_final_weights.pth')
+    torch.save(model.state_dict(), final_weights)
+    
     print(f"saved best model to {config.MODEL_DIR}/{model_type}_best.pth")
+    print(f"saved weights only to {config.MODEL_DIR}/{model_type}_weights.pth")
     
     return model, history
 
