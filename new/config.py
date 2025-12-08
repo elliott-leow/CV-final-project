@@ -42,7 +42,14 @@ NUM_EPOCHS = 10
 TRAIN_VAL_SPLIT = 0.8
 
 #detection parameters
-DETECTION_THRESHOLD = 0.5  #confidence threshold for detection
+DETECTION_THRESHOLD = 0.7  #confidence threshold for detection
+
+#spikey loss parameters (for better peak detection)
+FOCAL_ALPHA = 0.25     #positive class weight in focal loss
+FOCAL_GAMMA = 2.0      #focus on hard examples (higher = more focus)
+MARGIN_WEIGHT = 0.3    #weight for confidence margin loss
+POS_TARGET = 0.9       #target probability for bump frames
+NEG_TARGET = 0.1       #target probability for non-bump frames
 
 #create directories
 for d in [OUTPUT_DIR, MODEL_DIR, TRAINING_DATA_DIR]:

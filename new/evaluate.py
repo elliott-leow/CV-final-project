@@ -15,13 +15,29 @@ from data_generator import create_combined_features
 
 
 def load_model(model_path, model_type='simple', device=None):
-    """load trained model from checkpoint"""
+    """load trained model from checkpoint or weights file"""
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     model = get_model(model_type, in_channels=4)
-    checkpoint = torch.load(model_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    #try loading as checkpoint first, then as raw state_dict
+    try:
+        checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            #assume it's a raw state_dict
+            model.load_state_dict(checkpoint)
+    except Exception as e:
+        print(f"weights_only load failed: {e}")
+        print("trying with weights_only=False...")
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
+    
     model = model.to(device)
     model.eval()
     
@@ -248,24 +264,32 @@ def create_annotated_video(frames, predictions, detected_frames,
 
 
 def run_full_evaluation(video_path, model_path, model_type='simple', 
-                        ground_truth_path=None, max_frames=5000):
+                        ground_truth_path=None, max_frames=5000,
+                        scaled_video_path=None):
     """
     run complete evaluation pipeline on a video
+    
+    scaled_video_path: path to pre-scaled low-res video (skips scaling)
     """
     #load model
     print("loading model...")
     model, device = load_model(model_path, model_type)
     
     #load or process video
-    scaled_path = os.path.join(config.OUTPUT_DIR, "scaled_video.mp4")
-    if os.path.exists(scaled_path):
-        print(f"loading scaled video (max {max_frames} frames)...")
-        frames = load_scaled_video(scaled_path, max_frames=max_frames)
+    if scaled_video_path and os.path.exists(scaled_video_path):
+        print(f"using pre-scaled video: {scaled_video_path}")
+        print(f"loading (max {max_frames} frames)...")
+        frames = load_scaled_video(scaled_video_path, max_frames=max_frames)
     else:
-        from video_scaler import scale_video
-        print("scaling video...")
-        scale_video(video_path, scaled_path)
-        frames = load_scaled_video(scaled_path, max_frames=max_frames)
+        scaled_path = os.path.join(config.OUTPUT_DIR, "scaled_video.mp4")
+        if os.path.exists(scaled_path):
+            print(f"loading scaled video (max {max_frames} frames)...")
+            frames = load_scaled_video(scaled_path, max_frames=max_frames)
+        else:
+            from video_scaler import scale_video
+            print("scaling video...")
+            scale_video(video_path, scaled_path)
+            frames = load_scaled_video(scaled_path, max_frames=max_frames)
     
     #process edges - all canny edges, no filtering
     print("processing edges (all canny edges)...")
@@ -279,8 +303,10 @@ def run_full_evaluation(video_path, model_path, model_type='simple',
     predictions = sliding_window_inference(model, frames, edge_frames, device)
     
     #detect bumps
-    detected_frames, confidences = detect_bumps_from_predictions(predictions)
-    print(f"detected {len(detected_frames)} bumps")
+    detected_frames, confidences = detect_bumps_from_predictions(
+        predictions, threshold=config.DETECTION_THRESHOLD
+    )
+    print(f"detected {len(detected_frames)} bumps (threshold={config.DETECTION_THRESHOLD})")
     
     #load ground truth if available
     gt_frames = None
@@ -322,19 +348,26 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--video', type=str, 
-                       default=os.path.join(config.DATA_DIR, "PXL_20251118_131050616.TS.mp4"))
+                       default=os.path.join(config.DATA_DIR, "PXL_20251118_131050616.TS.mp4"),
+                       help='path to original video (for scaling if needed)')
+    parser.add_argument('--scaled-video', type=str, default=None,
+                       help='path to pre-scaled low-res video (skips scaling)')
     parser.add_argument('--model', type=str, 
                        default=os.path.join(config.MODEL_DIR, "simple_best.pth"))
     parser.add_argument('--model_type', type=str, default='simple',
                        choices=['unet', 'simple', 'attention'])
     parser.add_argument('--ground_truth', type=str,
                        default=os.path.join(config.OUTPUT_DIR, "ground_truth.npy"))
+    parser.add_argument('--max-frames', type=int, default=5000,
+                       help='max frames to evaluate')
     args = parser.parse_args()
     
     run_full_evaluation(
         args.video,
         args.model,
         model_type=args.model_type,
-        ground_truth_path=args.ground_truth
+        ground_truth_path=args.ground_truth,
+        max_frames=args.max_frames,
+        scaled_video_path=args.scaled_video
     )
 

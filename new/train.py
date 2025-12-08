@@ -3,6 +3,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
@@ -13,6 +14,64 @@ import matplotlib.pyplot as plt
 import config
 from model import get_model, count_parameters
 from data_generator import load_training_data
+
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss - focuses learning on hard examples
+    Reduces loss for well-classified examples, emphasizing hard ones
+    """
+    def __init__(self, alpha=0.25, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha  # balance factor for positive/negative
+        self.gamma = gamma  # focusing parameter (higher = more focus on hard examples)
+    
+    def forward(self, pred, target):
+        # pred should be probabilities (after sigmoid)
+        bce = F.binary_cross_entropy(pred, target, reduction='none')
+        
+        # pt is the probability of the correct class
+        pt = torch.where(target == 1, pred, 1 - pred)
+        
+        # alpha weighting
+        alpha_t = torch.where(target == 1, self.alpha, 1 - self.alpha)
+        
+        # focal term: (1 - pt)^gamma reduces loss for easy examples
+        focal_weight = alpha_t * (1 - pt) ** self.gamma
+        
+        loss = focal_weight * bce
+        return loss.mean()
+
+
+class SpikeyLoss(nn.Module):
+    """
+    Custom loss that encourages spiky predictions:
+    1. Focal loss for hard example mining
+    2. Margin loss to push predictions away from 0.5
+    3. Class-specific confidence targets (high for bumps, low for non-bumps)
+    """
+    def __init__(self, focal_alpha=0.25, focal_gamma=2.0, 
+                 margin_weight=0.3, pos_target=0.9, neg_target=0.1):
+        super().__init__()
+        self.focal = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+        self.margin_weight = margin_weight
+        self.pos_target = pos_target  # target probability for positive samples
+        self.neg_target = neg_target  # target probability for negative samples
+    
+    def forward(self, pred, target):
+        # Base focal loss
+        focal_loss = self.focal(pred, target)
+        
+        # Margin loss: penalize predictions that aren't confident enough
+        # For positive samples: push towards pos_target (e.g., 0.9)
+        # For negative samples: push towards neg_target (e.g., 0.1)
+        soft_targets = torch.where(target == 1, 
+                                   torch.full_like(pred, self.pos_target),
+                                   torch.full_like(pred, self.neg_target))
+        margin_loss = F.mse_loss(pred, soft_targets)
+        
+        total_loss = focal_loss + self.margin_weight * margin_loss
+        return total_loss
 
 
 class BumpDataset(Dataset):
@@ -186,8 +245,15 @@ def train_model(model_type='simple', epochs=None, batch_size=None, lr=None):
     model = model.to(device)
     print(f"model: {model_type}, parameters: {count_parameters(model):,}")
     
-    #loss and optimizer
-    criterion = nn.BCELoss()
+    #loss and optimizer - use SpikeyLoss for better peak detection
+    criterion = SpikeyLoss(
+        focal_alpha=config.FOCAL_ALPHA,
+        focal_gamma=config.FOCAL_GAMMA,
+        margin_weight=config.MARGIN_WEIGHT,
+        pos_target=config.POS_TARGET,
+        neg_target=config.NEG_TARGET
+    )
+    print(f"using SpikeyLoss (focal_gamma={config.FOCAL_GAMMA}, margin={config.MARGIN_WEIGHT})")
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=5

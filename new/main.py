@@ -335,7 +335,8 @@ def run_pipeline(video_path, model_type='simple', epochs=None,
             model_path,
             model_type=model_type,
             ground_truth_path=gt_path,
-            max_frames=max_frames
+            max_frames=max_frames,
+            scaled_video_path=scaled_path
         )
     else:
         print(f"model not found: {model_path}")
