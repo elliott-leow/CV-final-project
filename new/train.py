@@ -260,7 +260,7 @@ def train_model(model_type='simple', epochs=None, batch_size=None, lr=None):
     )
     print(f"using SpikeyLoss (focal_gamma={config.FOCAL_GAMMA}, margin={config.MARGIN_WEIGHT})")
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, mode='min', factor=0.5, patience=5
     )
     
