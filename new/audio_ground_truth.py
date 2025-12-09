@@ -1,5 +1,5 @@
 #steps 1-2: audio-based bump candidate generation with gaussian priors
-#uses bandpass filtering to identify approximate bump times
+#uses highpass filtering (>4000Hz) to identify approximate bump times
 
 import numpy as np
 import librosa
@@ -33,16 +33,13 @@ def extract_audio_from_video(video_path, output_path=None):
     return audio, config.AUDIO_SAMPLE_RATE, fps, duration
 
 
-def bandpass_filter(audio, sr, low_freq, high_freq):
-    """apply bandpass filter to isolate bump frequency band"""
+def highpass_filter(audio, sr, cutoff_freq):
+    """apply highpass filter - bumps have high energy above cutoff"""
     nyquist = sr / 2
-    low = max(0.01, low_freq / nyquist)
-    high = min(0.99, high_freq / nyquist)
+    normalized_cutoff = cutoff_freq / nyquist
+    normalized_cutoff = min(0.99, max(0.01, normalized_cutoff))
     
-    if low >= high:
-        low = high - 0.01
-    
-    b, a = butter(4, [low, high], btype='band')
+    b, a = butter(4, normalized_cutoff, btype='high')
     filtered = filtfilt(b, a, audio)
     return filtered
 
@@ -59,22 +56,22 @@ def compute_energy_envelope(audio, sr, window_sec=0.05):
 
 
 def detect_audio_bump_candidates(audio, sr, video_fps,
-                                  min_freq=None, max_freq=None,
+                                  highpass_freq=None,
                                   threshold_percentile=None,
                                   min_distance_sec=None):
     """
-    step 1: detect bump candidates using audio energy in frequency band
+    step 1: detect bump candidates using audio energy above highpass cutoff
+    bumps have high energy in frequencies above 4000Hz
     returns set of approximate bump times L_k (in frames)
     """
-    min_freq = min_freq or config.AUDIO_MIN_FREQ_HZ
-    max_freq = max_freq or config.AUDIO_MAX_FREQ_HZ
+    highpass_freq = highpass_freq or config.AUDIO_HIGHPASS_FREQ_HZ
     threshold_percentile = threshold_percentile or config.ENERGY_THRESHOLD_PERCENTILE
     min_distance_sec = min_distance_sec or config.MIN_BUMP_DISTANCE_SEC
     
-    print(f"  bandpass filter: {min_freq}Hz - {max_freq}Hz")
+    print(f"  highpass filter: >{highpass_freq}Hz")
     
-    #bandpass filter
-    filtered = bandpass_filter(audio, sr, min_freq, max_freq)
+    #highpass filter to isolate bump frequencies
+    filtered = highpass_filter(audio, sr, highpass_freq)
     
     #compute energy envelope
     envelope = compute_energy_envelope(filtered, sr, window_sec=0.05)
@@ -180,7 +177,7 @@ def generate_bump_candidates(video_path, target_fps=None, save_path=None):
     print(f"audio sample rate: {sr}, length: {len(audio)} samples")
     
     #step 1: detect audio bump candidates
-    print("step 1: detecting audio bump candidates...")
+    print("step 1: detecting audio bump candidates (high freq energy >4kHz)...")
     bump_frames_original, confidence, envelope, threshold = detect_audio_bump_candidates(
         audio, sr, video_fps
     )
@@ -231,7 +228,7 @@ def visualize_bump_candidates(result, save_path=None):
     fig, axes = plt.subplots(2, 1, figsize=(15, 8))
     
     #plot 1: energy envelope with threshold
-    axes[0].plot(time_axis, envelope, 'b-', alpha=0.7, label='bandpass energy')
+    axes[0].plot(time_axis, envelope, 'b-', alpha=0.7, label='highpass energy (>4kHz)')
     axes[0].axhline(y=threshold, color='r', linestyle='--', label='threshold')
     
     for c in candidates:
@@ -240,7 +237,7 @@ def visualize_bump_candidates(result, save_path=None):
     
     axes[0].set_xlabel('time (s)')
     axes[0].set_ylabel('energy')
-    axes[0].set_title(f'audio bump detection - {len(candidates)} candidates')
+    axes[0].set_title(f'audio bump detection (>4kHz) - {len(candidates)} candidates')
     axes[0].legend()
     
     #plot 2: candidate windows with priors

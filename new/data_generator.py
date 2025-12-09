@@ -1,5 +1,5 @@
 #step 3: clip extraction with noisy labels
-#extracts positive candidate clips and negative clips
+#extracts positive candidate clips and negative clips with class balance
 
 import numpy as np
 import os
@@ -10,13 +10,13 @@ import config
 
 
 def extract_candidate_clips(frames, feature_frames, candidates,
-                            horizon=None, clip_length=None):
+                            horizon=None, clip_length=None,
+                            samples_per_candidate=None):
     """
     step 3a: extract candidate positive clips for each bump candidate
     
-    for each candidate k and each possible true bump frame t in T_k:
-        - clip start s = t - H (horizon frames before bump)
-        - extract clip C_{k,t} = frames[s:s+T_clip]
+    for each candidate k, sample clips around the audio-detected frame.
+    by default, only extract 1 clip per candidate (at peak prior).
     
     args:
         frames: video frames (T, H, W, C)
@@ -24,6 +24,7 @@ def extract_candidate_clips(frames, feature_frames, candidates,
         candidates: list of candidate dicts from audio detection
         horizon: H - early warning horizon (frames before bump)
         clip_length: T_clip - length of each clip
+        samples_per_candidate: how many clips to extract per candidate
     
     returns:
         clips: list of clip arrays
@@ -32,6 +33,7 @@ def extract_candidate_clips(frames, feature_frames, candidates,
     """
     horizon = horizon or config.EARLY_WARNING_HORIZON
     clip_length = clip_length or config.CLIP_LENGTH
+    samples_per_candidate = samples_per_candidate or config.POSITIVE_SAMPLES_PER_CANDIDATE
     total_frames = len(frames)
     
     clips = []
@@ -40,12 +42,25 @@ def extract_candidate_clips(frames, feature_frames, candidates,
     
     print(f"extracting candidate positive clips...")
     print(f"  horizon H={horizon}, clip length={clip_length}")
+    print(f"  samples per candidate: {samples_per_candidate}")
     
     for k, cand in enumerate(tqdm(candidates, desc="candidate clips")):
         window = cand['window']
         prior = cand['prior']
+        audio_frame = cand['audio_frame']
         
-        for i, t in enumerate(window):
+        if samples_per_candidate == 1:
+            #only extract clip at audio frame (peak prior)
+            selected_indices = [np.argmax(prior)]
+        else:
+            #sample multiple clips, weighted by prior
+            n_samples = min(samples_per_candidate, len(window))
+            #select frames with highest priors
+            selected_indices = np.argsort(prior)[-n_samples:]
+        
+        for i in selected_indices:
+            t = window[i]
+            
             #clip start is t - H (predict bump at t, starting H frames before)
             s = t - horizon
             
@@ -63,7 +78,7 @@ def extract_candidate_clips(frames, feature_frames, candidates,
                 'bump_frame': t,
                 'clip_start': s,
                 'prior_weight': prior[i],
-                'audio_frame': cand['audio_frame'],
+                'audio_frame': audio_frame,
                 'type': 'positive_candidate'
             })
     
@@ -71,50 +86,28 @@ def extract_candidate_clips(frames, feature_frames, candidates,
     return clips, feature_clips, clip_info
 
 
-def get_candidate_exclusion_zones(candidates, clip_length, min_distance=None):
-    """get frame ranges to exclude for negative sampling"""
-    min_distance = min_distance or config.MIN_NEGATIVE_DISTANCE
+def get_bump_exclusion_frames(candidates, margin=None):
+    """get set of frames to avoid for negative sampling"""
+    margin = margin or config.MIN_NEGATIVE_DISTANCE
     
-    exclusion_ranges = []
+    excluded = set()
     for cand in candidates:
-        window = cand['window']
-        t_min = window.min()
-        t_max = window.max()
-        
-        #exclude zone: any clip that could contain frames near candidate
-        #clip at start s covers frames [s, s+clip_length-1]
-        #for safety, exclude starts that put any frame within min_distance of window
-        exclude_start = t_min - clip_length - min_distance + 1
-        exclude_end = t_max + min_distance
-        
-        exclusion_ranges.append((exclude_start, exclude_end))
+        audio_frame = cand['audio_frame']
+        #exclude frames around the bump
+        for f in range(audio_frame - margin, audio_frame + margin + 1):
+            excluded.add(f)
     
-    return exclusion_ranges
-
-
-def is_valid_negative_start(start, exclusion_ranges, clip_length, total_frames):
-    """check if a clip start is valid for negative sampling"""
-    if start < 0 or start + clip_length > total_frames:
-        return False
-    
-    clip_end = start + clip_length - 1
-    
-    for ex_start, ex_end in exclusion_ranges:
-        #check if clip overlaps with exclusion zone
-        if not (clip_end < ex_start or start > ex_end):
-            return False
-    
-    return True
+    return excluded
 
 
 def extract_negative_clips(frames, feature_frames, candidates,
-                           clip_length=None, num_negatives=None, 
-                           min_distance=None, sample_step=5):
+                           clip_length=None, num_negatives=None,
+                           min_distance=None, sample_step=3):
     """
     step 3b: extract negative clips far from any bump candidate
     
     negative clips are sampled from regions at least min_distance frames
-    away from any candidate window T_k
+    away from any bump audio frame
     
     args:
         frames: video frames
@@ -132,29 +125,35 @@ def extract_negative_clips(frames, feature_frames, candidates,
     min_distance = min_distance or config.MIN_NEGATIVE_DISTANCE
     total_frames = len(frames)
     
-    #get exclusion zones
-    exclusion_ranges = get_candidate_exclusion_zones(candidates, clip_length, min_distance)
+    #get frames to exclude (around bumps)
+    excluded_frames = get_bump_exclusion_frames(candidates, min_distance)
     
     #find valid negative start positions
-    print(f"finding negative clip positions (min {min_distance} frames from candidates)...")
+    print(f"finding negative clip positions (min {min_distance} frames from bumps)...")
     valid_starts = []
+    
     for s in range(0, total_frames - clip_length, sample_step):
-        if is_valid_negative_start(s, exclusion_ranges, clip_length, total_frames):
+        #check if any frame in this clip is excluded
+        clip_frames = set(range(s, s + clip_length))
+        if not clip_frames.intersection(excluded_frames):
             valid_starts.append(s)
     
     print(f"  found {len(valid_starts)} valid negative positions")
     
     if num_negatives is None:
-        #default: 2x positives (count all candidate clips)
-        num_candidates = sum(len(c['window']) for c in candidates)
-        num_negatives = min(num_candidates * config.NEGATIVES_PER_POSITIVE, len(valid_starts))
+        #default: match positives for balance
+        num_negatives = len(candidates)
+    
+    num_negatives = min(num_negatives, len(valid_starts))
     
     #sample evenly from valid positions
-    if len(valid_starts) > num_negatives:
-        step = len(valid_starts) // num_negatives
-        sampled_starts = valid_starts[::step][:num_negatives]
+    if len(valid_starts) > num_negatives and num_negatives > 0:
+        #random sample for variety
+        np.random.seed(42)
+        sampled_starts = np.random.choice(valid_starts, num_negatives, replace=False)
+        sampled_starts = sorted(sampled_starts)
     else:
-        sampled_starts = valid_starts
+        sampled_starts = valid_starts[:num_negatives]
     
     clips = []
     feature_clips = []
@@ -177,10 +176,10 @@ def extract_negative_clips(frames, feature_frames, candidates,
 
 
 def create_training_data(frames, feature_frames, candidates,
-                         horizon=None, clip_length=None, 
-                         min_distance=None, neg_ratio=None):
+                         horizon=None, clip_length=None,
+                         min_distance=None, balance_ratio=None):
     """
-    step 3: create complete training dataset with candidate positive and negative clips
+    step 3: create complete training dataset with balanced positive and negative clips
     
     returns:
         positive_clips: candidate positive clips (noisy labels)
@@ -193,25 +192,31 @@ def create_training_data(frames, feature_frames, candidates,
     horizon = horizon or config.EARLY_WARNING_HORIZON
     clip_length = clip_length or config.CLIP_LENGTH
     min_distance = min_distance or config.MIN_NEGATIVE_DISTANCE
-    neg_ratio = neg_ratio or config.NEGATIVES_PER_POSITIVE
+    balance_ratio = balance_ratio or config.CLASS_BALANCE_RATIO
     
     print("\nstep 3: extracting training clips...")
     print(f"  horizon: {horizon} frames")
     print(f"  clip length: {clip_length} frames")
+    print(f"  target class balance: {balance_ratio}")
     
-    #extract candidate positives
+    #extract candidate positives (1 per candidate by default)
     pos_clips, pos_features, pos_info = extract_candidate_clips(
         frames, feature_frames, candidates, horizon, clip_length
     )
     
-    #extract negatives
-    num_negatives = int(len(pos_clips) * neg_ratio / len(candidates)) if candidates else 0
+    #extract negatives to match positives
+    num_negatives = int(len(pos_clips) * balance_ratio)
     neg_clips, neg_features, neg_info = extract_negative_clips(
-        frames, feature_frames, candidates, clip_length, 
+        frames, feature_frames, candidates, clip_length,
         num_negatives, min_distance
     )
     
-    print(f"\ntotal clips: {len(pos_clips)} candidates, {len(neg_clips)} negatives")
+    print(f"\nclass balance: {len(pos_clips)} positives, {len(neg_clips)} negatives")
+    
+    if len(pos_clips) == 0:
+        raise ValueError("no positive clips extracted!")
+    if len(neg_clips) == 0:
+        raise ValueError("no negative clips extracted!")
     
     return (np.array(pos_clips), np.array(pos_features), pos_info,
             np.array(neg_clips), np.array(neg_features), neg_info)
@@ -249,7 +254,7 @@ def load_training_data(load_dir=None):
     neg_features = np.load(os.path.join(load_dir, 'neg_features.npy'))
     neg_info = np.load(os.path.join(load_dir, 'neg_info.npy'), allow_pickle=True)
     
-    print(f"loaded {len(pos_clips)} positive candidates, {len(neg_clips)} negatives")
+    print(f"loaded {len(pos_clips)} positives, {len(neg_clips)} negatives")
     return pos_clips, pos_features, pos_info, neg_clips, neg_features, neg_info
 
 

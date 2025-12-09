@@ -21,8 +21,7 @@ SHARPEN_RADIUS = 5  #unsharp mask radius
 
 #audio parameters for bump candidates (step 1)
 AUDIO_SAMPLE_RATE = 44100
-AUDIO_MIN_FREQ_HZ = 100  #low freq for bandpass
-AUDIO_MAX_FREQ_HZ = 4000  #high freq for bandpass
+AUDIO_HIGHPASS_FREQ_HZ = 4000  #highpass cutoff - bumps have energy above this
 ENERGY_THRESHOLD_PERCENTILE = 85
 MIN_BUMP_DISTANCE_SEC = 0.3  #merge candidates closer than this
 
@@ -33,8 +32,9 @@ GAUSSIAN_SIGMA = 2.0  #sigma for gaussian prior over offsets
 #clip extraction parameters (step 3)
 EARLY_WARNING_HORIZON = 8  #H - predict bump this many frames ahead
 CLIP_LENGTH = 15  #T_clip - frames per clip
-MIN_NEGATIVE_DISTANCE = 30  #frames away from any candidate for negatives
-NEGATIVES_PER_POSITIVE = 2  #ratio of negative to positive clips
+MIN_NEGATIVE_DISTANCE = 15  #frames away from any candidate for negatives
+POSITIVE_SAMPLES_PER_CANDIDATE = 1  #sample 1 clip per candidate (use prior peak)
+CLASS_BALANCE_RATIO = 1.0  #target ratio of negatives to positives
 
 #edge detection parameters (step 4)
 CANNY_LOW_THRESHOLD = 50
