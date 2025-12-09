@@ -22,8 +22,8 @@ SHARPEN_RADIUS = 5  #unsharp mask radius
 #audio parameters for bump candidates (step 1)
 AUDIO_SAMPLE_RATE = 44100
 AUDIO_HIGHPASS_FREQ_HZ = 4000  #highpass cutoff - bumps have energy above this
-ENERGY_THRESHOLD_PERCENTILE = 85
-MIN_BUMP_DISTANCE_SEC = 0.3  #merge candidates closer than this
+ENERGY_THRESHOLD_PERCENTILE = 92
+MIN_BUMP_DISTANCE_SEC = 0.5  #merge candidates closer than this
 
 #candidate window parameters (step 2)
 CANDIDATE_RADIUS = 5  #frames before/after audio candidate (r parameter)
@@ -33,7 +33,7 @@ GAUSSIAN_SIGMA = 2.0  #sigma for gaussian prior over offsets
 EARLY_WARNING_HORIZON = 8  #H - predict bump this many frames ahead
 CLIP_LENGTH = 15  #T_clip - frames per clip
 MIN_NEGATIVE_DISTANCE = 15  #frames away from any candidate for negatives
-POSITIVE_SAMPLES_PER_CANDIDATE = 1  #sample 1 clip per candidate (use prior peak)
+POSITIVE_SAMPLES_PER_CANDIDATE = 3  #sample 1 clip per candidate (use prior peak)
 CLASS_BALANCE_RATIO = 1.0  #target ratio of negatives to positives
 
 #edge detection parameters (step 4)
@@ -54,20 +54,20 @@ HIDDEN_DIM = 256
 FREEZE_EARLY_LAYERS = True  #freeze early pretrained layers
 
 #training parameters
-BATCH_SIZE = 16
+BATCH_SIZE = 24
 LEARNING_RATE = 5e-5
-NUM_EPOCHS = 20
+NUM_EPOCHS = 5
 TRAIN_VAL_SPLIT = 0.8
 GRAD_CLIP = 1.0
 
 #em training parameters (steps 6-7)
-EM_ITERATIONS = 5  #number of E-M cycles
+EM_ITERATIONS = 3  #number of E-M cycles
 EM_EPOCHS_PER_M_STEP = 3  #epochs per M-step
 LAMBDA_NEG = 1.0  #weight for negative class in loss
 RESPONSIBILITY_TEMPERATURE = 1.0  #temperature for softmax in E-step
 
 #inference parameters (step 8)
-DETECTION_THRESHOLD = 0.5
+DETECTION_THRESHOLD = 0.7
 INFERENCE_STRIDE = 1  #sliding window stride
 NMS_WINDOW = 10  #frames for non-maximum suppression
 
