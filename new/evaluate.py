@@ -10,7 +10,7 @@ import os
 
 import config
 from model import get_model
-from video_scaler import load_scaled_video, load_video_chunk, get_frame_count
+from video_scaler import load_scaled_video, load_video_chunk, get_frame_count, scale_video
 from edge_processor import process_frame_edges
 
 
@@ -396,10 +396,18 @@ def run_full_evaluation(video_path, model_path, model_type='unet',
     """
     step 8: run complete inference and evaluation pipeline
     """
-    #use scaled video if available
-    eval_video = scaled_video_path if scaled_video_path else video_path
-    if scaled_video_path and os.path.exists(scaled_video_path):
-        print(f"using scaled video: {scaled_video_path}")
+    #auto-generate scaled video path if not provided
+    if scaled_video_path is None:
+        base = os.path.splitext(os.path.basename(video_path))[0]
+        scaled_video_path = os.path.join(config.OUTPUT_DIR, f"{base}_scaled.mp4")
+    
+    #scale video if it doesn't exist
+    if not os.path.exists(scaled_video_path):
+        print(f"scaling video to {config.TARGET_WIDTH}x{config.TARGET_HEIGHT} @ {config.TARGET_FPS}fps...")
+        scale_video(video_path, scaled_video_path)
+    
+    eval_video = scaled_video_path
+    print(f"using scaled video: {eval_video}")
     
     #load model
     print("loading model...")

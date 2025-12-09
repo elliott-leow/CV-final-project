@@ -61,7 +61,7 @@ TRAIN_VAL_SPLIT = 0.8
 GRAD_CLIP = 1.0
 
 #em training parameters (steps 6-7)
-EM_ITERATIONS = 3  #number of E-M cycles
+EM_ITERATIONS = 1  #number of E-M cycles (1 = no EM, just prior weights)
 EM_EPOCHS_PER_M_STEP = 3  #epochs per M-step
 LAMBDA_NEG = 1.0  #weight for negative class in loss
 RESPONSIBILITY_TEMPERATURE = 1.0  #temperature for softmax in E-step
