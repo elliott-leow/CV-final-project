@@ -1,5 +1,5 @@
-#training data generation from processed video and ground truth
-#creates clips for bump detection training
+#step 3: clip extraction with noisy labels
+#extracts positive candidate clips and negative clips
 
 import numpy as np
 import os
@@ -9,123 +9,232 @@ import cv2
 import config
 
 
-def create_training_clips(frames, edge_frames, bump_frames, 
-                          frames_before=None, clip_length=None,
-                          min_frames_to_next=None):
+def extract_candidate_clips(frames, feature_frames, candidates,
+                            horizon=None, clip_length=None):
     """
-    create training clips from video frames and bump annotations
+    step 3a: extract candidate positive clips for each bump candidate
     
-    positive samples: clips ending at bump frame
-    negative samples: clips with no nearby bumps
+    for each candidate k and each possible true bump frame t in T_k:
+        - clip start s = t - H (horizon frames before bump)
+        - extract clip C_{k,t} = frames[s:s+T_clip]
+    
+    args:
+        frames: video frames (T, H, W, C)
+        feature_frames: processed feature frames (T, H, W, C_feat)
+        candidates: list of candidate dicts from audio detection
+        horizon: H - early warning horizon (frames before bump)
+        clip_length: T_clip - length of each clip
+    
+    returns:
+        clips: list of clip arrays
+        feature_clips: list of feature clip arrays
+        clip_info: list of dicts with metadata (k, t, prior weight, etc)
     """
-    frames_before = frames_before or config.FRAMES_BEFORE_BUMP
+    horizon = horizon or config.EARLY_WARNING_HORIZON
     clip_length = clip_length or config.CLIP_LENGTH
-    min_frames_to_next = min_frames_to_next or config.MIN_FRAMES_TO_NEXT_BUMP
-    
-    bump_set = set(bump_frames)
     total_frames = len(frames)
     
     clips = []
-    edge_clips = []
-    labels = []
+    feature_clips = []
     clip_info = []
     
-    #create positive samples
-    print("creating positive samples...")
-    valid_bumps = 0
-    for bump_frame in tqdm(bump_frames, desc="positive clips"):
-        start_frame = bump_frame - frames_before
-        end_frame = start_frame + clip_length
-        
-        if start_frame < 0 or end_frame > total_frames:
-            continue
-        
-        clip = frames[start_frame:end_frame]
-        edge_clip = edge_frames[start_frame:end_frame]
-        
-        clips.append(clip)
-        edge_clips.append(edge_clip)
-        labels.append(1)
-        clip_info.append({
-            'start': start_frame,
-            'end': end_frame,
-            'bump_frame': bump_frame,
-            'type': 'positive'
-        })
-        valid_bumps += 1
+    print(f"extracting candidate positive clips...")
+    print(f"  horizon H={horizon}, clip length={clip_length}")
     
-    print(f"  created {valid_bumps} positive clips")
-    
-    #create negative samples
-    print("creating negative samples...")
-    
-    #precompute distance to nearest future bump for each frame
-    bump_frames_sorted = np.sort(bump_frames)
-    
-    negative_starts = []
-    for frame_idx in tqdm(range(0, total_frames - clip_length, 5), desc="finding negatives"):  #sample every 5 frames
-        end_frame = frame_idx + clip_length
+    for k, cand in enumerate(tqdm(candidates, desc="candidate clips")):
+        window = cand['window']
+        prior = cand['prior']
         
-        #check if any bump is within clip
-        has_bump = np.any((bump_frames_sorted >= frame_idx) & (bump_frames_sorted < end_frame))
-        if has_bump:
-            continue
-        
-        #check distance to next bump after clip
-        future_bumps = bump_frames_sorted[bump_frames_sorted >= end_frame]
-        if len(future_bumps) > 0:
-            dist_to_next = future_bumps[0] - end_frame
-            if dist_to_next >= min_frames_to_next:
-                negative_starts.append(frame_idx)
-        else:
-            negative_starts.append(frame_idx)
-    
-    #sample negatives to balance
-    num_positives = len([l for l in labels if l == 1])
-    num_negatives_needed = min(num_positives * 2, len(negative_starts))
-    
-    if len(negative_starts) > 0:
-        step = max(1, len(negative_starts) // num_negatives_needed)
-        sampled_starts = negative_starts[::step][:num_negatives_needed]
-        
-        for start_frame in tqdm(sampled_starts, desc="negative clips"):
-            end_frame = start_frame + clip_length
+        for i, t in enumerate(window):
+            #clip start is t - H (predict bump at t, starting H frames before)
+            s = t - horizon
             
-            clip = frames[start_frame:end_frame]
-            edge_clip = edge_frames[start_frame:end_frame]
+            #check bounds
+            if s < 0 or s + clip_length > total_frames:
+                continue
+            
+            clip = frames[s:s+clip_length]
+            feat_clip = feature_frames[s:s+clip_length]
             
             clips.append(clip)
-            edge_clips.append(edge_clip)
-            labels.append(0)
+            feature_clips.append(feat_clip)
             clip_info.append({
-                'start': start_frame,
-                'end': end_frame,
-                'bump_frame': None,
-                'type': 'negative'
+                'candidate_idx': k,
+                'bump_frame': t,
+                'clip_start': s,
+                'prior_weight': prior[i],
+                'audio_frame': cand['audio_frame'],
+                'type': 'positive_candidate'
             })
     
-    num_pos = sum(labels)
-    num_neg = len(labels) - num_pos
-    print(f"created {num_pos} positive and {num_neg} negative clips")
+    print(f"  extracted {len(clips)} candidate positive clips")
+    return clips, feature_clips, clip_info
+
+
+def get_candidate_exclusion_zones(candidates, clip_length, min_distance=None):
+    """get frame ranges to exclude for negative sampling"""
+    min_distance = min_distance or config.MIN_NEGATIVE_DISTANCE
     
-    return np.array(clips), np.array(edge_clips), np.array(labels), clip_info
+    exclusion_ranges = []
+    for cand in candidates:
+        window = cand['window']
+        t_min = window.min()
+        t_max = window.max()
+        
+        #exclude zone: any clip that could contain frames near candidate
+        #clip at start s covers frames [s, s+clip_length-1]
+        #for safety, exclude starts that put any frame within min_distance of window
+        exclude_start = t_min - clip_length - min_distance + 1
+        exclude_end = t_max + min_distance
+        
+        exclusion_ranges.append((exclude_start, exclude_end))
+    
+    return exclusion_ranges
 
 
-def save_training_data(clips, edge_clips, labels, clip_info, save_dir=None):
+def is_valid_negative_start(start, exclusion_ranges, clip_length, total_frames):
+    """check if a clip start is valid for negative sampling"""
+    if start < 0 or start + clip_length > total_frames:
+        return False
+    
+    clip_end = start + clip_length - 1
+    
+    for ex_start, ex_end in exclusion_ranges:
+        #check if clip overlaps with exclusion zone
+        if not (clip_end < ex_start or start > ex_end):
+            return False
+    
+    return True
+
+
+def extract_negative_clips(frames, feature_frames, candidates,
+                           clip_length=None, num_negatives=None, 
+                           min_distance=None, sample_step=5):
+    """
+    step 3b: extract negative clips far from any bump candidate
+    
+    negative clips are sampled from regions at least min_distance frames
+    away from any candidate window T_k
+    
+    args:
+        frames: video frames
+        feature_frames: processed feature frames
+        candidates: list of candidate dicts
+        clip_length: length of each clip
+        num_negatives: target number of negative clips
+        min_distance: minimum frames from any candidate
+        sample_step: step for scanning valid positions
+    
+    returns:
+        clips, feature_clips, clip_info (with label=0, weight=1)
+    """
+    clip_length = clip_length or config.CLIP_LENGTH
+    min_distance = min_distance or config.MIN_NEGATIVE_DISTANCE
+    total_frames = len(frames)
+    
+    #get exclusion zones
+    exclusion_ranges = get_candidate_exclusion_zones(candidates, clip_length, min_distance)
+    
+    #find valid negative start positions
+    print(f"finding negative clip positions (min {min_distance} frames from candidates)...")
+    valid_starts = []
+    for s in range(0, total_frames - clip_length, sample_step):
+        if is_valid_negative_start(s, exclusion_ranges, clip_length, total_frames):
+            valid_starts.append(s)
+    
+    print(f"  found {len(valid_starts)} valid negative positions")
+    
+    if num_negatives is None:
+        #default: 2x positives (count all candidate clips)
+        num_candidates = sum(len(c['window']) for c in candidates)
+        num_negatives = min(num_candidates * config.NEGATIVES_PER_POSITIVE, len(valid_starts))
+    
+    #sample evenly from valid positions
+    if len(valid_starts) > num_negatives:
+        step = len(valid_starts) // num_negatives
+        sampled_starts = valid_starts[::step][:num_negatives]
+    else:
+        sampled_starts = valid_starts
+    
+    clips = []
+    feature_clips = []
+    clip_info = []
+    
+    for s in tqdm(sampled_starts, desc="negative clips"):
+        clip = frames[s:s+clip_length]
+        feat_clip = feature_frames[s:s+clip_length]
+        
+        clips.append(clip)
+        feature_clips.append(feat_clip)
+        clip_info.append({
+            'clip_start': s,
+            'weight': 1.0,
+            'type': 'negative'
+        })
+    
+    print(f"  extracted {len(clips)} negative clips")
+    return clips, feature_clips, clip_info
+
+
+def create_training_data(frames, feature_frames, candidates,
+                         horizon=None, clip_length=None, 
+                         min_distance=None, neg_ratio=None):
+    """
+    step 3: create complete training dataset with candidate positive and negative clips
+    
+    returns:
+        positive_clips: candidate positive clips (noisy labels)
+        positive_features: feature clips for positives
+        positive_info: metadata including prior weights
+        negative_clips: definite negative clips
+        negative_features: feature clips for negatives
+        negative_info: metadata
+    """
+    horizon = horizon or config.EARLY_WARNING_HORIZON
+    clip_length = clip_length or config.CLIP_LENGTH
+    min_distance = min_distance or config.MIN_NEGATIVE_DISTANCE
+    neg_ratio = neg_ratio or config.NEGATIVES_PER_POSITIVE
+    
+    print("\nstep 3: extracting training clips...")
+    print(f"  horizon: {horizon} frames")
+    print(f"  clip length: {clip_length} frames")
+    
+    #extract candidate positives
+    pos_clips, pos_features, pos_info = extract_candidate_clips(
+        frames, feature_frames, candidates, horizon, clip_length
+    )
+    
+    #extract negatives
+    num_negatives = int(len(pos_clips) * neg_ratio / len(candidates)) if candidates else 0
+    neg_clips, neg_features, neg_info = extract_negative_clips(
+        frames, feature_frames, candidates, clip_length, 
+        num_negatives, min_distance
+    )
+    
+    print(f"\ntotal clips: {len(pos_clips)} candidates, {len(neg_clips)} negatives")
+    
+    return (np.array(pos_clips), np.array(pos_features), pos_info,
+            np.array(neg_clips), np.array(neg_features), neg_info)
+
+
+def save_training_data(pos_clips, pos_features, pos_info,
+                       neg_clips, neg_features, neg_info,
+                       save_dir=None):
     """save training data to disk"""
     save_dir = save_dir or config.TRAINING_DATA_DIR
     os.makedirs(save_dir, exist_ok=True)
     
     print("saving training data...")
-    np.save(os.path.join(save_dir, 'clips.npy'), clips)
-    np.save(os.path.join(save_dir, 'edge_clips.npy'), edge_clips)
-    np.save(os.path.join(save_dir, 'labels.npy'), labels)
-    np.save(os.path.join(save_dir, 'clip_info.npy'), clip_info)
+    np.save(os.path.join(save_dir, 'pos_clips.npy'), pos_clips)
+    np.save(os.path.join(save_dir, 'pos_features.npy'), pos_features)
+    np.save(os.path.join(save_dir, 'pos_info.npy'), pos_info, allow_pickle=True)
+    np.save(os.path.join(save_dir, 'neg_clips.npy'), neg_clips)
+    np.save(os.path.join(save_dir, 'neg_features.npy'), neg_features)
+    np.save(os.path.join(save_dir, 'neg_info.npy'), neg_info, allow_pickle=True)
     
     print(f"saved to {save_dir}")
-    print(f"  clips: {clips.shape}")
-    print(f"  edge_clips: {edge_clips.shape}")
-    print(f"  labels: {labels.shape}")
+    print(f"  positive clips: {pos_clips.shape}")
+    print(f"  negative clips: {neg_clips.shape}")
 
 
 def load_training_data(load_dir=None):
@@ -133,21 +242,47 @@ def load_training_data(load_dir=None):
     load_dir = load_dir or config.TRAINING_DATA_DIR
     
     print("loading training data...")
-    clips = np.load(os.path.join(load_dir, 'clips.npy'))
-    edge_clips = np.load(os.path.join(load_dir, 'edge_clips.npy'))
-    labels = np.load(os.path.join(load_dir, 'labels.npy'))
-    clip_info = np.load(os.path.join(load_dir, 'clip_info.npy'), allow_pickle=True)
+    pos_clips = np.load(os.path.join(load_dir, 'pos_clips.npy'))
+    pos_features = np.load(os.path.join(load_dir, 'pos_features.npy'))
+    pos_info = np.load(os.path.join(load_dir, 'pos_info.npy'), allow_pickle=True)
+    neg_clips = np.load(os.path.join(load_dir, 'neg_clips.npy'))
+    neg_features = np.load(os.path.join(load_dir, 'neg_features.npy'))
+    neg_info = np.load(os.path.join(load_dir, 'neg_info.npy'), allow_pickle=True)
     
-    print(f"loaded {len(clips)} clips")
-    return clips, edge_clips, labels, clip_info
+    print(f"loaded {len(pos_clips)} positive candidates, {len(neg_clips)} negatives")
+    return pos_clips, pos_features, pos_info, neg_clips, neg_features, neg_info
 
 
-def create_combined_features(clips, edge_clips):
-    """combine RGB clips with edge features"""
+def organize_by_candidate(pos_info):
+    """organize positive clip indices by candidate for EM training"""
+    candidate_clips = {}
+    for i, info in enumerate(pos_info):
+        k = info['candidate_idx']
+        if k not in candidate_clips:
+            candidate_clips[k] = []
+        candidate_clips[k].append({
+            'clip_idx': i,
+            'bump_frame': info['bump_frame'],
+            'prior_weight': info['prior_weight']
+        })
+    return candidate_clips
+
+
+def get_prior_weights(pos_info):
+    """extract prior weights as array for training"""
+    return np.array([info['prior_weight'] for info in pos_info])
+
+
+def create_combined_features(clips, feature_clips):
+    """combine RGB clips with processed features (edges)"""
     rgb_normalized = clips.astype(np.float32) / 255.0
-    edges_normalized = edge_clips.astype(np.float32) / 255.0
-    edges_normalized = np.expand_dims(edges_normalized, axis=-1)
-    combined = np.concatenate([rgb_normalized, edges_normalized], axis=-1)
+    feat_normalized = feature_clips.astype(np.float32) / 255.0
+    
+    #ensure features have channel dimension
+    if len(feat_normalized.shape) == 4:  #(N, T, H, W)
+        feat_normalized = feat_normalized[..., np.newaxis]
+    
+    combined = np.concatenate([rgb_normalized, feat_normalized], axis=-1)
     return combined
 
 
@@ -157,8 +292,8 @@ def visualize_training_samples(clips, labels, num_samples=4, save_path=None):
     
     fig, axes = plt.subplots(num_samples, 5, figsize=(15, 3*num_samples))
     
-    pos_indices = np.where(labels == 1)[0]
-    neg_indices = np.where(labels == 0)[0]
+    pos_indices = np.where(np.array(labels) == 1)[0]
+    neg_indices = np.where(np.array(labels) == 0)[0]
     
     sample_indices = []
     n_pos = min(num_samples // 2, len(pos_indices))
@@ -176,7 +311,10 @@ def visualize_training_samples(clips, labels, num_samples=4, save_path=None):
         frame_indices = np.linspace(0, len(clip) - 1, 5).astype(int)
         
         for col, frame_idx in enumerate(frame_indices):
-            axes[row, col].imshow(clip[frame_idx])
+            frame = clip[frame_idx]
+            if frame.max() <= 1.0:
+                frame = (frame * 255).astype(np.uint8)
+            axes[row, col].imshow(frame[..., :3] if frame.shape[-1] > 3 else frame)
             axes[row, col].axis('off')
             if col == 0:
                 axes[row, col].set_title(f"{'BUMP' if label else 'NO BUMP'}", fontsize=12)
@@ -192,41 +330,38 @@ def visualize_training_samples(clips, labels, num_samples=4, save_path=None):
 
 
 if __name__ == "__main__":
-    from video_scaler import scale_video, load_scaled_video
-    from edge_processor import process_edges
-    from audio_ground_truth import generate_ground_truth
+    from video_scaler import load_scaled_video
+    from edge_processor import process_edge_features
+    from audio_ground_truth import generate_bump_candidates
     
     video_path = os.path.join(config.DATA_DIR, "PXL_20251118_131050616.TS.mp4")
     
     if os.path.exists(video_path):
         scaled_path = os.path.join(config.OUTPUT_DIR, "scaled_video.mp4")
-        gt_path = os.path.join(config.OUTPUT_DIR, "ground_truth.npy")
+        candidates_path = os.path.join(config.OUTPUT_DIR, "bump_candidates.npy")
         
+        #load frames
         if not os.path.exists(scaled_path):
-            frames, _ = scale_video(video_path, scaled_path)
+            from video_scaler import scale_video
+            scale_video(video_path, scaled_path)
+        frames = load_scaled_video(scaled_path, max_frames=3000)
+        
+        #load or generate candidates
+        if os.path.exists(candidates_path):
+            result = np.load(candidates_path, allow_pickle=True).item()
+            candidates = result['candidates']
         else:
-            frames = load_scaled_video(scaled_path)
+            result = generate_bump_candidates(video_path, save_path=candidates_path)
+            candidates = result['candidates']
         
-        if not os.path.exists(gt_path):
-            gt = generate_ground_truth(video_path, save_path=gt_path)
-        else:
-            gt = np.load(gt_path, allow_pickle=True).item()
+        #process features
+        feature_frames = process_edge_features(frames)
         
-        edge_results = process_edges(frames)
-        edge_frames = edge_results['filtered']
+        #create training data
+        data = create_training_data(frames, feature_frames, candidates)
+        pos_clips, pos_features, pos_info, neg_clips, neg_features, neg_info = data
         
-        original_fps = gt['video_fps']
-        bump_frames_original = gt['bump_frames']
-        fps_ratio = config.TARGET_FPS / original_fps
-        bump_frames_scaled = (bump_frames_original * fps_ratio).astype(int)
-        
-        clips, edge_clips, labels, clip_info = create_training_clips(
-            frames, edge_frames, bump_frames_scaled
-        )
-        
-        save_training_data(clips, edge_clips, labels, clip_info)
-        
-        viz_path = os.path.join(config.OUTPUT_DIR, "training_samples.png")
-        visualize_training_samples(clips, labels, save_path=viz_path)
+        save_training_data(pos_clips, pos_features, pos_info,
+                          neg_clips, neg_features, neg_info)
     else:
         print(f"video not found: {video_path}")

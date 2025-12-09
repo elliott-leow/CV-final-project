@@ -1,4 +1,4 @@
-#configuration constants for bump detection pipeline
+#configuration constants for bump detection pipeline with EM training
 
 import os
 
@@ -8,51 +8,73 @@ OUTPUT_DIR = "output"
 MODEL_DIR = "models"
 TRAINING_DATA_DIR = "training_data"
 
-#video parameters
+#video parameters (step 0)
 TARGET_WIDTH = 320
 TARGET_HEIGHT = 240
 TARGET_FPS = 15
 ORIGINAL_FPS = 30  #assumed, will be read from video
 
-#audio parameters for ground truth
+#video scaling parameters (step 0)
+LOWPASS_SIGMA = 0.8  #mild blur before downscale
+SHARPEN_AMOUNT = 0.5  #mild edge sharpening after downscale
+SHARPEN_RADIUS = 5  #unsharp mask radius
+
+#audio parameters for bump candidates (step 1)
 AUDIO_SAMPLE_RATE = 44100
-MIN_FREQ_HZ = 100  #low frequency threshold for bump detection
-MAX_FREQ_HZ = 2000  #high frequency threshold
-ENERGY_THRESHOLD_PERCENTILE = 85  #percentile for bump energy threshold
-MIN_BUMP_DISTANCE_SEC = 0.3  #minimum time between bumps
+AUDIO_MIN_FREQ_HZ = 100  #low freq for bandpass
+AUDIO_MAX_FREQ_HZ = 4000  #high freq for bandpass
+ENERGY_THRESHOLD_PERCENTILE = 85
+MIN_BUMP_DISTANCE_SEC = 0.3  #merge candidates closer than this
 
-#training clip parameters
-FRAMES_BEFORE_BUMP = 8  #frames to look back before bump (detect 8 frames before bump)
-CLIP_LENGTH = 15  #total frames per training clip
-MIN_FRAMES_TO_NEXT_BUMP = 30  #minimum frames to next bump for negative samples
+#candidate window parameters (step 2)
+CANDIDATE_RADIUS = 5  #frames before/after audio candidate (r parameter)
+GAUSSIAN_SIGMA = 2.0  #sigma for gaussian prior over offsets
 
-#edge detection parameters
+#clip extraction parameters (step 3)
+EARLY_WARNING_HORIZON = 8  #H - predict bump this many frames ahead
+CLIP_LENGTH = 15  #T_clip - frames per clip
+MIN_NEGATIVE_DISTANCE = 30  #frames away from any candidate for negatives
+NEGATIVES_PER_POSITIVE = 2  #ratio of negative to positive clips
+
+#edge detection parameters (step 4)
 CANNY_LOW_THRESHOLD = 50
 CANNY_HIGH_THRESHOLD = 150
-TEMPORAL_KERNEL_SIZE = 3  #frames for morphological operations
-MIN_EDGE_TEMPORAL_LENGTH = 3  #minimum frames for edge persistence
-MAX_EDGE_ANGLE_FROM_HORIZONTAL = 70  #degrees
+EDGE_BLUR_SIGMA = 1.0  #optional blur on edges
+MORPHO_KERNEL_SIZE = 3  #for thinning/dilation
+EDGE_CHANNELS = 3  #thin edges, thick edges, edge magnitude
 
-#model parameters
-INPUT_CHANNELS = 3
-INPUT_FRAMES = 15
-BATCH_SIZE = 16          #increased for more stable gradients
-LEARNING_RATE = 5e-5     #reduced for stability with focal loss
-NUM_EPOCHS = 10
+#model parameters (step 5)
+INPUT_CHANNELS = 4  #rgb + edge channel
+INPUT_FRAMES = CLIP_LENGTH
+BASE_FILTERS = 64
+DROPOUT = 0.3
+BACKBONE = 'resnet18'  #resnet18, resnet34, efficientnet_b0, mobilenet_v3
+TEMPORAL_HEAD = 'gru'  #gru, cnn, lstm
+HIDDEN_DIM = 256
+FREEZE_EARLY_LAYERS = True  #freeze early pretrained layers
+
+#training parameters
+BATCH_SIZE = 16
+LEARNING_RATE = 5e-5
+NUM_EPOCHS = 20
 TRAIN_VAL_SPLIT = 0.8
-GRAD_CLIP = 1.0          #gradient clipping for stability
+GRAD_CLIP = 1.0
 
-#detection parameters
-DETECTION_THRESHOLD = 0.7  #confidence threshold for detection
+#em training parameters (steps 6-7)
+EM_ITERATIONS = 5  #number of E-M cycles
+EM_EPOCHS_PER_M_STEP = 3  #epochs per M-step
+LAMBDA_NEG = 1.0  #weight for negative class in loss
+RESPONSIBILITY_TEMPERATURE = 1.0  #temperature for softmax in E-step
 
-#spikey loss parameters (for better peak detection)
-FOCAL_ALPHA = 0.25     #positive class weight in focal loss
-FOCAL_GAMMA = 2.0      #focus on hard examples (higher = more focus)
-MARGIN_WEIGHT = 0.2    #weight for confidence margin loss (lower = more stable)
-POS_TARGET = 0.85      #target probability for bump frames
-NEG_TARGET = 0.15      #target probability for non-bump frames
+#inference parameters (step 8)
+DETECTION_THRESHOLD = 0.5
+INFERENCE_STRIDE = 1  #sliding window stride
+NMS_WINDOW = 10  #frames for non-maximum suppression
+
+#focal loss parameters
+FOCAL_ALPHA = 0.25
+FOCAL_GAMMA = 2.0
 
 #create directories
 for d in [OUTPUT_DIR, MODEL_DIR, TRAINING_DATA_DIR]:
     os.makedirs(d, exist_ok=True)
-

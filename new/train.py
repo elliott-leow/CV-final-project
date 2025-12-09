@@ -1,4 +1,6 @@
-#training script for bump detection model
+#steps 6-7: em-style training with noisy bump times
+#e-step: compute responsibilities w_{k,t}
+#m-step: weighted discriminative training
 
 import numpy as np
 import torch
@@ -6,161 +8,194 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from tqdm import tqdm
 import os
 import matplotlib.pyplot as plt
 
 import config
 from model import get_model, count_parameters
-from data_generator import load_training_data
+from data_generator import load_training_data, organize_by_candidate, get_prior_weights
 
 
-class FocalLoss(nn.Module):
+class EMBumpDataset(Dataset):
     """
-    Focal Loss - focuses learning on hard examples
-    Reduces loss for well-classified examples, emphasizing hard ones
+    dataset for em training with weighted samples
+    handles both positive candidates (with responsibilities) and negatives
     """
-    def __init__(self, alpha=0.25, gamma=2.0):
-        super().__init__()
-        self.alpha = alpha  # balance factor for positive/negative
-        self.gamma = gamma  # focusing parameter (higher = more focus on hard examples)
-    
-    def forward(self, pred, target):
-        # pred should be probabilities (after sigmoid)
-        bce = F.binary_cross_entropy(pred, target, reduction='none')
-        
-        # pt is the probability of the correct class
-        pt = torch.where(target == 1, pred, 1 - pred)
-        
-        # alpha weighting
-        alpha_t = torch.where(target == 1, self.alpha, 1 - self.alpha)
-        
-        # focal term: (1 - pt)^gamma reduces loss for easy examples
-        focal_weight = alpha_t * (1 - pt) ** self.gamma
-        
-        loss = focal_weight * bce
-        return loss.mean()
-
-
-class SpikeyLoss(nn.Module):
-    """
-    Custom loss that encourages spiky predictions:
-    1. Focal loss for hard example mining
-    2. Margin loss to push predictions away from 0.5
-    3. Class-specific confidence targets (high for bumps, low for non-bumps)
-    """
-    def __init__(self, focal_alpha=0.25, focal_gamma=2.0, 
-                 margin_weight=0.3, pos_target=0.9, neg_target=0.1):
-        super().__init__()
-        self.focal = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
-        self.margin_weight = margin_weight
-        self.pos_target = pos_target  # target probability for positive samples
-        self.neg_target = neg_target  # target probability for negative samples
-    
-    def forward(self, pred, target):
-        # Base focal loss
-        focal_loss = self.focal(pred, target)
-        
-        # Margin loss: penalize predictions that aren't confident enough
-        # For positive samples: push towards pos_target (e.g., 0.9)
-        # For negative samples: push towards neg_target (e.g., 0.1)
-        soft_targets = torch.where(target == 1, 
-                                   torch.full_like(pred, self.pos_target),
-                                   torch.full_like(pred, self.neg_target))
-        margin_loss = F.mse_loss(pred, soft_targets)
-        
-        total_loss = focal_loss + self.margin_weight * margin_loss
-        return total_loss
-
-
-class BumpDataset(Dataset):
-    """pytorch dataset for bump detection clips - lazy loading"""
-    def __init__(self, clips, edge_clips, labels, augment=False):
+    def __init__(self, clips, features, weights, labels):
         self.clips = clips
-        self.edge_clips = edge_clips
+        self.features = features
+        self.weights = weights.astype(np.float32)
         self.labels = labels.astype(np.float32)
-        self.augment = augment
     
     def __len__(self):
         return len(self.labels)
     
     def __getitem__(self, idx):
-        #load and normalize on-the-fly to save memory
+        #normalize and combine
         clip = self.clips[idx].astype(np.float32) / 255.0
-        edge = self.edge_clips[idx].astype(np.float32) / 255.0
-        edge = np.expand_dims(edge, axis=-1)
+        feat = self.features[idx].astype(np.float32) / 255.0
         
-        #combine rgb + edge
-        x = np.concatenate([clip, edge], axis=-1)
+        #stack rgb + edges or luma + edges
+        if len(feat.shape) == 3:
+            feat = feat[..., np.newaxis]
         
-        #transpose to (C, T, H, W) for pytorch
+        #use rgb + single edge channel for simplicity
+        x = np.concatenate([clip, feat[..., :1]], axis=-1)
+        
+        #transpose to (C, T, H, W)
         x = np.transpose(x, (3, 0, 1, 2))
         
-        if self.augment:
-            x = self._augment(x)
-        
-        return torch.tensor(x, dtype=torch.float32), torch.tensor(self.labels[idx])
+        return (torch.tensor(x, dtype=torch.float32),
+                torch.tensor(self.labels[idx]),
+                torch.tensor(self.weights[idx]))
+
+
+def e_step(model, pos_clips, pos_features, pos_info, device, temperature=1.0):
+    """
+    step 6: e-step - compute soft assignment of true bump frame for each audio event
     
-    def _augment(self, x):
-        """apply data augmentation"""
-        if np.random.rand() > 0.5:
-            x = np.flip(x, axis=3).copy()
-        
-        if np.random.rand() > 0.5:
-            factor = 0.8 + np.random.rand() * 0.4
-            x[:3] = np.clip(x[:3] * factor, 0, 1)
-        
-        return x
-
-
-class EarlyStopping:
-    """early stopping to prevent overfitting"""
-    def __init__(self, patience=7, min_delta=0.001):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.counter = 0
-        self.best_loss = None
-        self.early_stop = False
+    for each candidate k and each possible bump frame t in T_k:
+        w_{k,t} ∝ π_k(t) * p_θ(y=1|C_{k,t})
+    normalize so sum over t = 1 for each k
     
-    def __call__(self, val_loss):
-        if self.best_loss is None:
-            self.best_loss = val_loss
-        elif val_loss > self.best_loss - self.min_delta:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.early_stop = True
-        else:
-            self.best_loss = val_loss
-            self.counter = 0
+    returns: updated weights array
+    """
+    model.eval()
+    
+    #organize clips by candidate
+    candidate_clips = organize_by_candidate(pos_info)
+    
+    weights = np.zeros(len(pos_info))
+    
+    with torch.no_grad():
+        for k, clip_list in candidate_clips.items():
+            #get indices and priors for this candidate
+            indices = [c['clip_idx'] for c in clip_list]
+            priors = np.array([c['prior_weight'] for c in clip_list])
+            
+            #compute model predictions for all clips in this candidate
+            batch_x = []
+            for idx in indices:
+                clip = pos_clips[idx].astype(np.float32) / 255.0
+                feat = pos_features[idx].astype(np.float32) / 255.0
+                
+                if len(feat.shape) == 3:
+                    feat = feat[..., np.newaxis]
+                
+                x = np.concatenate([clip, feat[..., :1]], axis=-1)
+                x = np.transpose(x, (3, 0, 1, 2))
+                batch_x.append(x)
+            
+            batch_x = torch.tensor(np.array(batch_x), dtype=torch.float32).to(device)
+            probs = model.predict_proba(batch_x).cpu().numpy()
+            
+            #compute responsibilities: w_{k,t} ∝ π_k(t) * p_θ(y=1|C_{k,t})
+            log_priors = np.log(priors + 1e-10)
+            log_probs = np.log(probs + 1e-10)
+            log_weights = (log_priors + log_probs) / temperature
+            
+            #normalize via softmax
+            log_weights = log_weights - log_weights.max()
+            responsibilities = np.exp(log_weights)
+            responsibilities = responsibilities / (responsibilities.sum() + 1e-10)
+            
+            #assign to weight array
+            for i, idx in enumerate(indices):
+                weights[idx] = responsibilities[i]
+    
+    return weights
 
 
-def train_epoch(model, loader, criterion, optimizer, device, grad_clip=None):
-    """train for one epoch with optional gradient clipping"""
+def m_step_loss(pred, target, weight, lambda_neg=1.0):
+    """
+    step 7: compute weighted cross-entropy loss
+    
+    L_pos = -sum_k sum_t w_{k,t} * log p_θ(y=1|C_{k,t})
+    L_neg = -λ * sum_u log(1 - p_θ(y=1|C_u^neg))
+    
+    pred: model predictions (probabilities)
+    target: labels (1 for positive candidates, 0 for negatives)
+    weight: responsibilities for positives, 1.0 for negatives
+    """
+    eps = 1e-7
+    pred = torch.clamp(pred, eps, 1 - eps)
+    
+    #positive loss (weighted by responsibility)
+    pos_mask = target == 1
+    if pos_mask.sum() > 0:
+        pos_loss = -weight[pos_mask] * torch.log(pred[pos_mask])
+        pos_loss = pos_loss.sum()
+    else:
+        pos_loss = torch.tensor(0.0, device=pred.device)
+    
+    #negative loss (weight = 1 for negatives)
+    neg_mask = target == 0
+    if neg_mask.sum() > 0:
+        neg_loss = -lambda_neg * torch.log(1 - pred[neg_mask])
+        neg_loss = neg_loss.sum()
+    else:
+        neg_loss = torch.tensor(0.0, device=pred.device)
+    
+    total_loss = (pos_loss + neg_loss) / len(pred)
+    return total_loss
+
+
+class FocalLoss(nn.Module):
+    """focal loss for hard example mining"""
+    def __init__(self, alpha=0.25, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+    
+    def forward(self, pred, target, weight=None):
+        eps = 1e-7
+        pred = torch.clamp(pred, eps, 1 - eps)
+        
+        bce = -target * torch.log(pred) - (1 - target) * torch.log(1 - pred)
+        pt = torch.where(target == 1, pred, 1 - pred)
+        alpha_t = torch.where(target == 1, self.alpha, 1 - self.alpha)
+        
+        focal_weight = alpha_t * (1 - pt) ** self.gamma
+        
+        if weight is not None:
+            focal_weight = focal_weight * weight
+        
+        loss = focal_weight * bce
+        return loss.mean()
+
+
+def train_epoch_em(model, loader, optimizer, device, lambda_neg=1.0, grad_clip=None):
+    """train one epoch with weighted loss"""
     model.train()
     total_loss = 0
     all_preds = []
     all_labels = []
     
     pbar = tqdm(loader, desc="training", leave=False)
-    for batch_x, batch_y in pbar:
+    for batch_x, batch_y, batch_w in pbar:
         batch_x = batch_x.to(device)
         batch_y = batch_y.to(device)
+        batch_w = batch_w.to(device)
         
         optimizer.zero_grad()
-        outputs = model(batch_x)
-        loss = criterion(outputs, batch_y)
+        
+        #get probabilities
+        probs = model.predict_proba(batch_x)
+        
+        #weighted loss
+        loss = m_step_loss(probs, batch_y, batch_w, lambda_neg)
         
         loss.backward()
         
-        # gradient clipping for stability
-        if grad_clip is not None:
+        if grad_clip:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         
         optimizer.step()
         
         total_loss += loss.item()
-        all_preds.extend(outputs.detach().cpu().numpy())
+        all_preds.extend(probs.detach().cpu().numpy())
         all_labels.extend(batch_y.cpu().numpy())
         
         pbar.set_postfix({'loss': f'{loss.item():.4f}'})
@@ -172,23 +207,24 @@ def train_epoch(model, loader, criterion, optimizer, device, grad_clip=None):
     return avg_loss, acc
 
 
-def evaluate(model, loader, criterion, device):
-    """evaluate model on validation set"""
+def evaluate_em(model, loader, device, lambda_neg=1.0):
+    """evaluate model"""
     model.eval()
     total_loss = 0
     all_preds = []
     all_labels = []
     
     with torch.no_grad():
-        for batch_x, batch_y in tqdm(loader, desc="evaluating", leave=False):
+        for batch_x, batch_y, batch_w in tqdm(loader, desc="evaluating", leave=False):
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
+            batch_w = batch_w.to(device)
             
-            outputs = model(batch_x)
-            loss = criterion(outputs, batch_y)
+            probs = model.predict_proba(batch_x)
+            loss = m_step_loss(probs, batch_y, batch_w, lambda_neg)
             
             total_loss += loss.item()
-            all_preds.extend(outputs.cpu().numpy())
+            all_preds.extend(probs.cpu().numpy())
             all_labels.extend(batch_y.cpu().numpy())
     
     avg_loss = total_loss / len(loader)
@@ -204,45 +240,50 @@ def evaluate(model, loader, criterion, device):
         'f1': f1_score(labels_array, preds_binary, zero_division=0),
     }
     
-    if len(np.unique(labels_array)) > 1:
-        metrics['auc'] = roc_auc_score(labels_array, all_preds)
-    else:
-        metrics['auc'] = 0.0
-    
     return metrics
 
 
-def train_model(model_type='simple', epochs=None, batch_size=None, lr=None):
-    """main training function"""
-    epochs = epochs or config.NUM_EPOCHS
+def train_em(model_type='unet', em_iterations=None, epochs_per_m=None,
+             batch_size=None, lr=None):
+    """
+    steps 6-7: em-style training loop
+    
+    repeat:
+        e-step: recompute w_{k,t} with updated model
+        m-step: train with weighted loss for several epochs
+    until convergence
+    """
+    em_iterations = em_iterations or config.EM_ITERATIONS
+    epochs_per_m = epochs_per_m or config.EM_EPOCHS_PER_M_STEP
     batch_size = batch_size or config.BATCH_SIZE
     lr = lr or config.LEARNING_RATE
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"using device: {device}")
     
+    #load training data
     print("loading training data...")
-    clips, edge_clips, labels, _ = load_training_data()
-    print(f"loaded {len(clips)} clips, {sum(labels)} positive, {len(labels) - sum(labels)} negative")
+    pos_clips, pos_features, pos_info, neg_clips, neg_features, neg_info = load_training_data()
+    print(f"loaded {len(pos_clips)} positive candidates, {len(neg_clips)} negatives")
+    
+    #initialize weights with priors for positives, 1.0 for negatives
+    pos_weights = get_prior_weights(pos_info)
+    neg_weights = np.ones(len(neg_clips))
+    
+    #combine data
+    all_clips = np.concatenate([pos_clips, neg_clips], axis=0)
+    all_features = np.concatenate([pos_features, neg_features], axis=0)
+    all_weights = np.concatenate([pos_weights, neg_weights], axis=0)
+    all_labels = np.concatenate([np.ones(len(pos_clips)), np.zeros(len(neg_clips))])
     
     #train/val split
-    indices = np.arange(len(clips))
+    indices = np.arange(len(all_clips))
     train_idx, val_idx = train_test_split(
-        indices, test_size=1-config.TRAIN_VAL_SPLIT, 
-        stratify=labels, random_state=42
+        indices, test_size=1-config.TRAIN_VAL_SPLIT,
+        stratify=all_labels, random_state=42
     )
     
-    print(f"train samples: {len(train_idx)}, val samples: {len(val_idx)}")
-    
-    train_dataset = BumpDataset(clips[train_idx], edge_clips[train_idx], 
-                                labels[train_idx], augment=True)
-    val_dataset = BumpDataset(clips[val_idx], edge_clips[val_idx], 
-                              labels[val_idx], augment=False)
-    
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, 
-                             shuffle=True, num_workers=0, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, 
-                           shuffle=False, num_workers=0, pin_memory=True)
+    print(f"train: {len(train_idx)}, val: {len(val_idx)}")
     
     #create model
     in_channels = 4  #rgb + edge
@@ -250,113 +291,136 @@ def train_model(model_type='simple', epochs=None, batch_size=None, lr=None):
     model = model.to(device)
     print(f"model: {model_type}, parameters: {count_parameters(model):,}")
     
-    #loss and optimizer - use SpikeyLoss for better peak detection
-    criterion = SpikeyLoss(
-        focal_alpha=config.FOCAL_ALPHA,
-        focal_gamma=config.FOCAL_GAMMA,
-        margin_weight=config.MARGIN_WEIGHT,
-        pos_target=config.POS_TARGET,
-        neg_target=config.NEG_TARGET
-    )
-    print(f"using SpikeyLoss (focal_gamma={config.FOCAL_GAMMA}, margin={config.MARGIN_WEIGHT})")
+    #optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, mode='min', factor=0.5, patience=5
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3
     )
     
-    #training loop
-    early_stopping = EarlyStopping(patience=10)
-    history = {'train_loss': [], 'val_loss': [], 'val_acc': [], 
-               'val_f1': [], 'val_auc': []}
     best_val_loss = float('inf')
+    history = {'em_iter': [], 'train_loss': [], 'val_loss': [], 'val_f1': []}
     
-    #gradient clipping value
-    grad_clip = getattr(config, 'GRAD_CLIP', 1.0)
-    print(f"\nstarting training for {epochs} epochs (grad_clip={grad_clip})...")
+    print(f"\nstarting EM training: {em_iterations} iterations x {epochs_per_m} epochs/M-step")
     
-    for epoch in range(epochs):
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, grad_clip=grad_clip)
-        val_metrics = evaluate(model, val_loader, criterion, device)
+    for em_iter in range(em_iterations):
+        print(f"\n{'='*60}")
+        print(f"EM ITERATION {em_iter + 1}/{em_iterations}")
+        print(f"{'='*60}")
         
-        scheduler.step(val_metrics['loss'])
-        
-        history['train_loss'].append(train_loss)
-        history['val_loss'].append(val_metrics['loss'])
-        history['val_acc'].append(val_metrics['accuracy'])
-        history['val_f1'].append(val_metrics['f1'])
-        history['val_auc'].append(val_metrics['auc'])
-        
-        if val_metrics['loss'] < best_val_loss:
-            best_val_loss = val_metrics['loss']
+        #e-step: update responsibilities (skip first iteration, use priors)
+        if em_iter > 0:
+            print("\nE-STEP: computing responsibilities...")
+            new_pos_weights = e_step(
+                model, pos_clips, pos_features, pos_info, device,
+                temperature=config.RESPONSIBILITY_TEMPERATURE
+            )
             
-            #save full checkpoint (for resuming training)
-            save_path = os.path.join(config.MODEL_DIR, f'{model_type}_best.pth')
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_metrics': val_metrics,
-            }, save_path)
+            #update weights for positives
+            all_weights[:len(pos_clips)] = new_pos_weights
             
-            #save weights only (for inference)
-            weights_path = os.path.join(config.MODEL_DIR, f'{model_type}_weights.pth')
-            torch.save(model.state_dict(), weights_path)
+            #show weight distribution
+            print(f"  weight stats: min={new_pos_weights.min():.4f}, "
+                  f"max={new_pos_weights.max():.4f}, "
+                  f"mean={new_pos_weights.mean():.4f}")
         
-        print(f"epoch {epoch+1}/{epochs} | "
-              f"train_loss: {train_loss:.4f} | "
-              f"val_loss: {val_metrics['loss']:.4f} | "
-              f"val_acc: {val_metrics['accuracy']:.4f} | "
-              f"val_f1: {val_metrics['f1']:.4f} | "
-              f"val_auc: {val_metrics['auc']:.4f}")
+        #m-step: train with current weights
+        print(f"\nM-STEP: training for {epochs_per_m} epochs...")
         
-        early_stopping(val_metrics['loss'])
-        if early_stopping.early_stop:
-            print(f"early stopping at epoch {epoch+1}")
-            break
+        #create datasets with current weights
+        train_dataset = EMBumpDataset(
+            all_clips[train_idx], all_features[train_idx],
+            all_weights[train_idx], all_labels[train_idx]
+        )
+        val_dataset = EMBumpDataset(
+            all_clips[val_idx], all_features[val_idx],
+            all_weights[val_idx], all_labels[val_idx]
+        )
+        
+        train_loader = DataLoader(train_dataset, batch_size=batch_size,
+                                  shuffle=True, num_workers=0, pin_memory=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size,
+                               shuffle=False, num_workers=0, pin_memory=True)
+        
+        for epoch in range(epochs_per_m):
+            train_loss, train_acc = train_epoch_em(
+                model, train_loader, optimizer, device,
+                lambda_neg=config.LAMBDA_NEG,
+                grad_clip=config.GRAD_CLIP
+            )
+            
+            val_metrics = evaluate_em(model, val_loader, device, config.LAMBDA_NEG)
+            scheduler.step(val_metrics['loss'])
+            
+            history['em_iter'].append(em_iter)
+            history['train_loss'].append(train_loss)
+            history['val_loss'].append(val_metrics['loss'])
+            history['val_f1'].append(val_metrics['f1'])
+            
+            print(f"  epoch {epoch+1}/{epochs_per_m} | "
+                  f"train_loss: {train_loss:.4f} | "
+                  f"val_loss: {val_metrics['loss']:.4f} | "
+                  f"val_f1: {val_metrics['f1']:.4f}")
+            
+            #save best model
+            if val_metrics['loss'] < best_val_loss:
+                best_val_loss = val_metrics['loss']
+                save_path = os.path.join(config.MODEL_DIR, f'{model_type}_best.pth')
+                torch.save({
+                    'em_iter': em_iter,
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'val_metrics': val_metrics,
+                }, save_path)
     
-    #save final model (checkpoint)
+    #save final model
     final_path = os.path.join(config.MODEL_DIR, f'{model_type}_final.pth')
     torch.save({
-        'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'history': history,
     }, final_path)
     
-    #save final weights only
     final_weights = os.path.join(config.MODEL_DIR, f'{model_type}_final_weights.pth')
     torch.save(model.state_dict(), final_weights)
     
-    print(f"saved best model to {config.MODEL_DIR}/{model_type}_best.pth")
-    print(f"saved weights only to {config.MODEL_DIR}/{model_type}_weights.pth")
+    print(f"\nsaved best model to {config.MODEL_DIR}/{model_type}_best.pth")
     
     return model, history
 
 
 def plot_training_history(history, save_path=None):
-    """plot training curves"""
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    """plot EM training curves"""
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     
-    axes[0, 0].plot(history['train_loss'], label='train')
-    axes[0, 0].plot(history['val_loss'], label='val')
-    axes[0, 0].set_xlabel('epoch')
-    axes[0, 0].set_ylabel('loss')
-    axes[0, 0].legend()
-    axes[0, 0].set_title('loss')
+    #loss over all epochs
+    axes[0].plot(history['train_loss'], label='train', alpha=0.7)
+    axes[0].plot(history['val_loss'], label='val', alpha=0.7)
+    axes[0].set_xlabel('epoch (across EM iterations)')
+    axes[0].set_ylabel('loss')
+    axes[0].legend()
+    axes[0].set_title('loss')
     
-    axes[0, 1].plot(history['val_acc'], label='val accuracy')
-    axes[0, 1].set_xlabel('epoch')
-    axes[0, 1].set_ylabel('accuracy')
-    axes[0, 1].set_title('validation accuracy')
+    #f1 score
+    axes[1].plot(history['val_f1'], 'g-', alpha=0.7)
+    axes[1].set_xlabel('epoch')
+    axes[1].set_ylabel('f1')
+    axes[1].set_title('validation f1')
     
-    axes[1, 0].plot(history['val_f1'], label='val f1')
-    axes[1, 0].set_xlabel('epoch')
-    axes[1, 0].set_ylabel('f1 score')
-    axes[1, 0].set_title('validation f1 score')
+    #em iteration markers
+    em_iters = np.array(history['em_iter'])
+    unique_iters = np.unique(em_iters)
+    colors = plt.cm.viridis(np.linspace(0, 1, len(unique_iters)))
     
-    axes[1, 1].plot(history['val_auc'], label='val auc')
-    axes[1, 1].set_xlabel('epoch')
-    axes[1, 1].set_ylabel('auc')
-    axes[1, 1].set_title('validation auc')
+    for i, it in enumerate(unique_iters):
+        mask = em_iters == it
+        idx = np.where(mask)[0]
+        axes[2].scatter(idx, np.array(history['val_loss'])[mask], 
+                       c=[colors[i]], label=f'EM {it+1}', alpha=0.7)
+    
+    axes[2].set_xlabel('epoch')
+    axes[2].set_ylabel('val loss')
+    axes[2].set_title('loss by EM iteration')
+    axes[2].legend()
     
     plt.tight_layout()
     
@@ -368,20 +432,36 @@ def plot_training_history(history, save_path=None):
     return fig
 
 
+#legacy function for backwards compatibility
+def train_model(model_type='simple', epochs=None, batch_size=None, lr=None):
+    """alias for train_em with single iteration for backward compat"""
+    return train_em(
+        model_type=model_type,
+        em_iterations=1,
+        epochs_per_m=epochs or config.NUM_EPOCHS,
+        batch_size=batch_size,
+        lr=lr
+    )
+
+
 if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, default='simple', 
-                       choices=['unet', 'simple', 'attention'])
-    parser.add_argument('--epochs', type=int, default=config.NUM_EPOCHS)
+    parser.add_argument('--model', type=str, default='resnet_gru',
+                       choices=['resnet_gru', 'resnet_cnn', 'resnet_lstm',
+                                'efficientnet_gru', 'mobilenet_gru',
+                                'lightweight_gru', 'lightweight_cnn'])
+    parser.add_argument('--em-iterations', type=int, default=config.EM_ITERATIONS)
+    parser.add_argument('--epochs-per-m', type=int, default=config.EM_EPOCHS_PER_M_STEP)
     parser.add_argument('--batch_size', type=int, default=config.BATCH_SIZE)
     parser.add_argument('--lr', type=float, default=config.LEARNING_RATE)
     args = parser.parse_args()
     
-    model, history = train_model(
+    model, history = train_em(
         model_type=args.model,
-        epochs=args.epochs,
+        em_iterations=args.em_iterations,
+        epochs_per_m=args.epochs_per_m,
         batch_size=args.batch_size,
         lr=args.lr
     )

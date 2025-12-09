@@ -1,5 +1,5 @@
-#main pipeline script for bump detection with checkpoint system
-#orchestrates all components with ability to resume from checkpoints
+#main pipeline script for bump detection with EM training
+#orchestrates all steps 0-8 with checkpoint support
 
 import os
 import argparse
@@ -8,23 +8,17 @@ from tqdm import tqdm
 import json
 
 import config
-from audio_ground_truth import generate_ground_truth, visualize_ground_truth
-from video_scaler import scale_video, load_scaled_video, get_frame_count
-from edge_processor import process_edges, canny_edge_detection, create_feature_video, create_overlay_video
-from data_generator import save_training_data, visualize_training_samples
-from train import train_model, plot_training_history
-from evaluate import run_full_evaluation
 
 
 #checkpoint definitions
 CHECKPOINTS = {
     0: 'start',
-    1: 'ground_truth',
-    2: 'video_scaling', 
-    3: 'edge_processing',
-    4: 'training_data',
-    5: 'model_training',
-    6: 'evaluation'
+    1: 'video_scaling',       #step 0
+    2: 'audio_candidates',    #steps 1-2
+    3: 'edge_processing',     #step 4 (preprocessing)
+    4: 'training_data',       #step 3
+    5: 'model_training',      #steps 5-7
+    6: 'evaluation'           #step 8
 }
 
 
@@ -53,117 +47,34 @@ def load_checkpoint():
     return None
 
 
-def create_training_clips_from_data(frames, edge_frames, bump_frames,
-                                     frames_before=None, clip_length=None, 
-                                     min_frames_to_next=None):
+def run_pipeline(video_path, model_type='unet', 
+                 em_iterations=None, epochs_per_m=None,
+                 max_frames=5000, from_checkpoint=None, fresh_start=False,
+                 scaled_video_path=None):
     """
-    create training clips from processed data
+    run complete bump detection pipeline with EM training
     
-    positive labeling: any 15-frame window that includes the frame which is
-    'frames_before' frames ahead of the bump is marked positive.
-    this gives a wider range of positive samples around each bump.
+    step 0: downscale video with edge preservation
+    steps 1-2: audio bump candidates with gaussian priors
+    step 3: clip extraction with noisy labels
+    step 4: edge detection and feature stacking
+    steps 5-7: em-style training
+    step 8: sliding window inference with nms
     """
-    frames_before = frames_before or config.FRAMES_BEFORE_BUMP
-    clip_length = clip_length or config.CLIP_LENGTH
-    min_frames_to_next = min_frames_to_next or config.MIN_FRAMES_TO_NEXT_BUMP
-    total_frames = len(frames)
-    
-    print(f"  clip config: {frames_before} frames before bump, {clip_length} frame clips")
-    print(f"  positive window: any clip containing frame (bump - {frames_before})")
-    
-    #compute target frames (the frame 'frames_before' before each bump)
-    target_frames = set()
-    for bump_frame in bump_frames:
-        target = bump_frame - frames_before
-        if 0 <= target < total_frames:
-            target_frames.add(target)
-    
-    #find all valid positive clip start positions
-    #a clip starting at S covers frames S to S+(clip_length-1)
-    #for clip to contain target T: S <= T <= S+(clip_length-1)
-    #so: T-(clip_length-1) <= S <= T
-    positive_starts = set()
-    for target in target_frames:
-        min_start = max(0, target - (clip_length - 1))
-        max_start = min(target, total_frames - clip_length)
-        for s in range(min_start, max_start + 1):
-            positive_starts.add(s)
-    
-    print(f"  found {len(positive_starts)} valid positive clip positions")
-    
-    clips = []
-    edge_clips = []
-    labels = []
-    
-    #sample positive clips (not all, to avoid too many duplicates)
-    print("creating positive samples...")
-    positive_starts_list = sorted(list(positive_starts))
-    
-    #sample evenly from positive positions (take every Nth to limit count)
-    max_pos = min(len(positive_starts_list), len(bump_frames) * 3)
-    step = max(1, len(positive_starts_list) // max_pos)
-    sampled_pos = positive_starts_list[::step][:max_pos]
-    
-    for start_frame in tqdm(sampled_pos, desc="positive clips"):
-        end_frame = start_frame + clip_length
-        clips.append(frames[start_frame:end_frame])
-        edge_clips.append(edge_frames[start_frame:end_frame])
-        labels.append(1)
-    
-    num_pos = len(clips)
-    print(f"  created {num_pos} positive clips")
-    
-    #find negative samples (clips that don't overlap with any positive window)
-    print("creating negative samples...")
-    negative_starts = []
-    for frame_idx in range(0, total_frames - clip_length, 10):
-        #check if this clip overlaps with any positive window
-        if frame_idx in positive_starts:
-            continue
-        
-        #also check it doesn't contain any target frame
-        clip_end = frame_idx + clip_length - 1
-        is_positive = False
-        for target in target_frames:
-            if frame_idx <= target <= clip_end:
-                is_positive = True
-                break
-        if is_positive:
-            continue
-        
-        negative_starts.append(frame_idx)
-    
-    num_neg_needed = min(num_pos * 2, len(negative_starts))
-    if len(negative_starts) > 0:
-        step = max(1, len(negative_starts) // num_neg_needed)
-        sampled = negative_starts[::step][:num_neg_needed]
-        
-        for start_frame in tqdm(sampled, desc="negative clips"):
-            end_frame = start_frame + clip_length
-            clips.append(frames[start_frame:end_frame])
-            edge_clips.append(edge_frames[start_frame:end_frame])
-            labels.append(0)
-    
-    print(f"created {num_pos} positive and {len(labels) - num_pos} negative clips")
-    
-    return np.array(clips), np.array(edge_clips), np.array(labels)
-
-
-def run_pipeline(video_path, model_type='simple', epochs=None, 
-                max_frames=5000, from_checkpoint=None, fresh_start=False,
-                scaled_video_path=None):
-    """
-    run complete bump detection pipeline with checkpoint support
-    
-    from_checkpoint: int or str - start from this checkpoint (0-6 or name)
-    fresh_start: bool - ignore all checkpoints and start fresh
-    scaled_video_path: str - path to pre-scaled low-res video (skips scaling step)
-    """
-    epochs = epochs or config.NUM_EPOCHS
+    em_iterations = em_iterations or config.EM_ITERATIONS
+    epochs_per_m = epochs_per_m or config.EM_EPOCHS_PER_M_STEP
     
     print("="*60)
-    print("BUMP DETECTION PIPELINE")
+    print("BUMP DETECTION PIPELINE (EM Training)")
     print("="*60)
+    
+    #imports
+    from video_scaler import scale_video, load_scaled_video, get_frame_count
+    from audio_ground_truth import generate_bump_candidates, visualize_bump_candidates
+    from edge_processor import process_edge_features, create_feature_video, create_overlay_video
+    from data_generator import create_training_data, save_training_data, visualize_training_samples
+    from train import train_em, plot_training_history
+    from evaluate import run_full_evaluation
     
     #check if using pre-scaled video
     use_prescaled = scaled_video_path is not None
@@ -174,10 +85,8 @@ def run_pipeline(video_path, model_type='simple', epochs=None,
     start_step = 0
     if fresh_start:
         print("fresh start - ignoring all checkpoints")
-        start_step = 0
     elif from_checkpoint is not None:
         if isinstance(from_checkpoint, str):
-            #find step by name
             for step, name in CHECKPOINTS.items():
                 if name == from_checkpoint:
                     start_step = step
@@ -186,147 +95,140 @@ def run_pipeline(video_path, model_type='simple', epochs=None,
             start_step = int(from_checkpoint)
         print(f"starting from checkpoint {start_step}: {CHECKPOINTS.get(start_step)}")
     else:
-        #check for saved checkpoint
         saved = load_checkpoint()
         if saved:
             start_step = saved['step']
             print(f"resuming from checkpoint {start_step}: {CHECKPOINTS.get(start_step)}")
     
     #file paths
-    gt_path = os.path.join(config.OUTPUT_DIR, "ground_truth.npy")
     scaled_path = scaled_video_path if use_prescaled else os.path.join(config.OUTPUT_DIR, "scaled_video.mp4")
-    edges_path = os.path.join(config.OUTPUT_DIR, "edges.npy")
-    feature_path = os.path.join(config.OUTPUT_DIR, "feature_map.mp4")
-    overlay_path = os.path.join(config.OUTPUT_DIR, "edge_overlay.mp4")
+    candidates_path = os.path.join(config.OUTPUT_DIR, "bump_candidates.npy")
+    #model path uses model_type directly
     model_path = os.path.join(config.MODEL_DIR, f"{model_type}_best.pth")
     
-    #========== STEP 1: GROUND TRUTH ==========
-    if start_step <= 1:
-        print("\n" + "="*60)
-        print("STEP 1: GROUND TRUTH GENERATION (>4kHz audio)")
-        print("="*60)
-        
-        gt = generate_ground_truth(video_path, save_path=gt_path)
-        viz_path = os.path.join(config.OUTPUT_DIR, "ground_truth_viz.png")
-        visualize_ground_truth(gt, save_path=viz_path)
-        
-        print(f"detected {len(gt['bump_frames'])} bumps from audio")
-        save_checkpoint(1)
-    else:
-        print("\n[skipping step 1: ground truth - loading from file]")
-        gt = np.load(gt_path, allow_pickle=True).item()
-        print(f"loaded {len(gt['bump_frames'])} bumps")
-    
-    #========== STEP 2: VIDEO SCALING ==========
+    #========== STEP 0: VIDEO SCALING ==========
     if use_prescaled:
         print("\n" + "="*60)
-        print("STEP 2: VIDEO SCALING (using pre-scaled video)")
+        print("STEP 0: VIDEO SCALING (using pre-scaled video)")
         print("="*60)
         total_frames = get_frame_count(scaled_path)
         print(f"pre-scaled video: {scaled_path}")
         print(f"total frames: {total_frames}")
-        save_checkpoint(2, {'total_frames': total_frames})
-    elif start_step <= 2:
+        save_checkpoint(1, {'total_frames': total_frames})
+    elif start_step <= 1:
         print("\n" + "="*60)
-        print("STEP 2: VIDEO SCALING")
+        print("STEP 0: VIDEO SCALING (edge-preserving downscale)")
         print("="*60)
         
-        total_frames, _ = scale_video(video_path, scaled_path)
-        save_checkpoint(2, {'total_frames': total_frames})
+        total_frames, _ = scale_video(video_path, scaled_path, keep_audio=True)
+        save_checkpoint(1, {'total_frames': total_frames})
     else:
-        print("\n[skipping step 2: video scaling - using existing file]")
+        print("\n[skipping step 0: video scaling - using existing file]")
         total_frames = get_frame_count(scaled_path)
         print(f"scaled video has {total_frames} frames")
     
-    #limit frames for memory
     use_frames = min(total_frames, max_frames)
     print(f"using {use_frames} of {total_frames} frames")
     
-    #========== STEP 3: EDGE PROCESSING ==========
+    #========== STEPS 1-2: AUDIO BUMP CANDIDATES ==========
+    if start_step <= 2:
+        print("\n" + "="*60)
+        print("STEPS 1-2: AUDIO BUMP CANDIDATES WITH GAUSSIAN PRIORS")
+        print("="*60)
+        
+        result = generate_bump_candidates(video_path, save_path=candidates_path)
+        viz_path = os.path.join(config.OUTPUT_DIR, "bump_candidates_viz.png")
+        visualize_bump_candidates(result, save_path=viz_path)
+        
+        print(f"detected {len(result['bump_frames'])} audio bump candidates")
+        candidates = result['candidates']
+        save_checkpoint(2)
+    else:
+        print("\n[skipping steps 1-2: audio candidates - loading from file]")
+        result = np.load(candidates_path, allow_pickle=True).item()
+        candidates = result['candidates']
+        print(f"loaded {len(candidates)} candidates")
+    
+    #filter candidates to frame range
+    valid_candidates = [c for c in candidates if c['audio_frame'] < use_frames]
+    print(f"using {len(valid_candidates)} candidates within frame range")
+    
+    #========== STEP 4: EDGE PROCESSING (before step 3 for features) ==========
     if start_step <= 3:
         print("\n" + "="*60)
-        print("STEP 3: EDGE DETECTION (all canny edges, no filtering)")
+        print("STEP 4: EDGE DETECTION AND FEATURE STACKING")
         print("="*60)
         
         print(f"loading {use_frames} frames...")
         frames = load_scaled_video(scaled_path, max_frames=use_frames)
         
-        print("processing edges...")
-        edge_results = process_edges(frames)
-        edge_frames = edge_results['filtered']
+        print("processing edge features...")
+        features = process_edge_features(frames)
         
-        #save edges
-        print("saving edge data...")
-        np.save(edges_path, edge_frames)
-        
-        #save videos (subset for preview)
+        #save preview videos
         print("saving preview videos...")
-        subset_size = min(1000, len(frames))
-        create_feature_video(frames[:subset_size], edge_frames[:subset_size], feature_path)
-        create_overlay_video(frames[:subset_size], edge_frames[:subset_size], overlay_path)
+        subset = min(1000, len(frames))
+        feature_path = os.path.join(config.OUTPUT_DIR, "feature_map.mp4")
+        create_feature_video(frames[:subset], features[:subset], feature_path)
+        
+        overlay_path = os.path.join(config.OUTPUT_DIR, "edge_overlay.mp4")
+        create_overlay_video(frames[:subset], features[:subset], overlay_path)
         
         save_checkpoint(3)
     else:
-        print("\n[skipping step 3: edge processing - loading from file]")
+        print("\n[skipping step 4: edge processing - loading frames]")
         frames = load_scaled_video(scaled_path, max_frames=use_frames)
-        edge_frames = np.load(edges_path)
-        if len(edge_frames) > use_frames:
-            edge_frames = edge_frames[:use_frames]
-        print(f"loaded {len(edge_frames)} edge frames")
+        features = process_edge_features(frames, show_progress=True)
     
-    #========== STEP 4: TRAINING DATA ==========
+    #========== STEP 3: TRAINING DATA GENERATION ==========
     if start_step <= 4:
         print("\n" + "="*60)
-        print("STEP 4: TRAINING DATA GENERATION")
+        print("STEP 3: CLIP EXTRACTION WITH NOISY LABELS")
         print("="*60)
         
-        #adjust bump frames for new fps
-        original_fps = gt['video_fps']
-        fps_ratio = config.TARGET_FPS / original_fps
-        bump_frames_scaled = (gt['bump_frames'] * fps_ratio).astype(int)
+        data = create_training_data(frames, features, valid_candidates)
+        pos_clips, pos_features, pos_info, neg_clips, neg_features, neg_info = data
         
-        #filter to only bumps within our frame range
-        bump_frames_valid = bump_frames_scaled[bump_frames_scaled < use_frames]
-        print(f"using {len(bump_frames_valid)} bumps within frame range")
-        
-        clips, edge_clips, labels = create_training_clips_from_data(
-            frames, edge_frames, bump_frames_valid
-        )
-        
-        #save training data
-        clip_info = []
-        save_training_data(clips, edge_clips, labels, clip_info)
+        save_training_data(pos_clips, pos_features, pos_info,
+                          neg_clips, neg_features, neg_info)
         
         #visualize samples
-        if len(clips) > 0:
+        if len(pos_clips) > 0:
+            all_clips = np.concatenate([pos_clips[:10], neg_clips[:10]])
+            all_labels = np.concatenate([np.ones(min(10, len(pos_clips))), 
+                                        np.zeros(min(10, len(neg_clips)))])
             viz_path = os.path.join(config.OUTPUT_DIR, "training_samples.png")
-            visualize_training_samples(clips, labels, save_path=viz_path)
+            visualize_training_samples(all_clips, all_labels, save_path=viz_path)
         
         save_checkpoint(4)
     else:
-        print("\n[skipping step 4: training data - using existing files]")
+        print("\n[skipping step 3: training data - using existing files]")
     
     #free memory
-    del frames, edge_frames
+    del frames, features
     
-    #========== STEP 5: MODEL TRAINING ==========
+    #========== STEPS 5-7: EM TRAINING ==========
     if start_step <= 5:
         print("\n" + "="*60)
-        print("STEP 5: MODEL TRAINING")
+        print("STEPS 5-7: EM-STYLE TRAINING")
         print("="*60)
         
-        model, history = train_model(model_type=model_type, epochs=epochs)
+        model, history = train_em(
+            model_type=model_type,
+            em_iterations=em_iterations,
+            epochs_per_m=epochs_per_m
+        )
         
         plot_path = os.path.join(config.OUTPUT_DIR, f'training_history_{model_type}.png')
         plot_training_history(history, save_path=plot_path)
         
         save_checkpoint(5)
     else:
-        print("\n[skipping step 5: model training - using existing model]")
+        print("\n[skipping steps 5-7: model training - using existing model]")
     
-    #========== STEP 6: EVALUATION ==========
+    #========== STEP 8: EVALUATION ==========
     print("\n" + "="*60)
-    print("STEP 6: EVALUATION")
+    print("STEP 8: SLIDING WINDOW INFERENCE AND EVALUATION")
     print("="*60)
     
     if os.path.exists(model_path):
@@ -334,7 +236,7 @@ def run_pipeline(video_path, model_type='simple', epochs=None,
             video_path,
             model_path,
             model_type=model_type,
-            ground_truth_path=gt_path,
+            ground_truth_path=candidates_path,
             max_frames=max_frames,
             scaled_video_path=scaled_path
         )
@@ -353,21 +255,25 @@ def run_pipeline(video_path, model_type='simple', epochs=None,
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Bump Detection Pipeline')
-    parser.add_argument('--video', type=str, 
+    parser = argparse.ArgumentParser(description='Bump Detection Pipeline with EM Training')
+    parser.add_argument('--video', type=str,
                        default=os.path.join(config.DATA_DIR, "PXL_20251118_131050616.TS.mp4"),
-                       help='path to input video (used for audio ground truth)')
+                       help='path to input video')
     parser.add_argument('--scaled-video', type=str, default=None,
-                       help='path to pre-scaled low-res video (skips scaling step)')
-    parser.add_argument('--model', type=str, default='simple',
-                       choices=['unet', 'simple', 'attention'],
-                       help='model architecture')
-    parser.add_argument('--epochs', type=int, default=config.NUM_EPOCHS,
-                       help='number of training epochs')
+                       help='path to pre-scaled video (skips scaling step)')
+    parser.add_argument('--model', type=str, default='resnet_gru',
+                       choices=['resnet_gru', 'resnet_cnn', 'resnet_lstm',
+                                'efficientnet_gru', 'mobilenet_gru',
+                                'lightweight_gru', 'lightweight_cnn'],
+                       help='model architecture (pretrained encoder + temporal head)')
+    parser.add_argument('--em-iterations', type=int, default=config.EM_ITERATIONS,
+                       help='number of EM iterations')
+    parser.add_argument('--epochs-per-m', type=int, default=config.EM_EPOCHS_PER_M_STEP,
+                       help='epochs per M-step')
     parser.add_argument('--max-frames', type=int, default=5000,
                        help='max frames to use for training')
     parser.add_argument('--from-checkpoint', type=str, default=None,
-                       help='start from checkpoint (0-6 or name: start, ground_truth, video_scaling, edge_processing, training_data, model_training, evaluation)')
+                       help='start from checkpoint (0-6 or name)')
     parser.add_argument('--fresh', action='store_true',
                        help='ignore all checkpoints and start fresh')
     
@@ -392,7 +298,8 @@ def main():
     run_pipeline(
         video_path=args.video,
         model_type=args.model,
-        epochs=args.epochs,
+        em_iterations=args.em_iterations,
+        epochs_per_m=args.epochs_per_m,
         max_frames=args.max_frames,
         from_checkpoint=from_cp,
         fresh_start=args.fresh,

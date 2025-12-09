@@ -1,4 +1,5 @@
-#evaluation and visualization of bump detection results
+#step 8: sliding window inference with non-maximum suppression
+#runs trained model on full video and generates bump detection plot
 
 import numpy as np
 import torch
@@ -9,25 +10,23 @@ import os
 
 import config
 from model import get_model
-from video_scaler import load_scaled_video
-from edge_processor import canny_edge_detection
-from data_generator import create_combined_features
+from video_scaler import load_scaled_video, load_video_chunk, get_frame_count
+from edge_processor import process_frame_edges
 
 
-def load_model(model_path, model_type='simple', device=None):
+def load_model(model_path, model_type='unet', device=None):
     """load trained model from checkpoint or weights file"""
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     model = get_model(model_type, in_channels=4)
     
-    #try loading as checkpoint first, then as raw state_dict
+    #try loading as checkpoint, then as raw state_dict
     try:
         checkpoint = torch.load(model_path, map_location=device, weights_only=True)
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
             model.load_state_dict(checkpoint['model_state_dict'])
         else:
-            #assume it's a raw state_dict
             model.load_state_dict(checkpoint)
     except Exception as e:
         print(f"weights_only load failed: {e}")
@@ -44,91 +43,173 @@ def load_model(model_path, model_type='simple', device=None):
     return model, device
 
 
-def sliding_window_inference(model, frames, edge_frames, device, 
-                             window_size=15, stride=1, batch_size=8):
+def prepare_clip_input(clip, feature_clip):
+    """prepare a single clip for model input"""
+    clip_norm = clip.astype(np.float32) / 255.0
+    feat_norm = feature_clip.astype(np.float32) / 255.0
+    
+    #use single edge channel
+    if len(feat_norm.shape) == 4:
+        feat_norm = feat_norm[..., :1]
+    elif len(feat_norm.shape) == 3:
+        feat_norm = feat_norm[..., np.newaxis]
+    
+    x = np.concatenate([clip_norm, feat_norm], axis=-1)
+    x = np.transpose(x, (3, 0, 1, 2))  #(C, T, H, W)
+    
+    return x
+
+
+def sliding_window_inference(model, video_path, device,
+                             window_size=None, stride=None, batch_size=8,
+                             max_frames=None):
     """
-    run model inference using sliding window over video
-    returns bump probability for each frame
+    step 8: run trained model on full video using sliding window
+    
+    for each window starting at time s:
+        build input tensor X_s
+        compute p_θ(y=1|X_s)
+        predicted bump time = s + H (early warning horizon)
+    
+    returns:
+        predictions: bump probability for each frame
+        bump_times: predicted bump frame indices (from clip start + H)
     """
-    T, H, W, C = frames.shape
-    num_windows = (T - window_size) // stride + 1
+    window_size = window_size or config.CLIP_LENGTH
+    stride = stride or config.INFERENCE_STRIDE
+    horizon = config.EARLY_WARNING_HORIZON
     
-    print(f"running inference on {num_windows} windows...")
+    total_frames = get_frame_count(video_path)
+    if max_frames:
+        total_frames = min(total_frames, max_frames)
     
-    #prepare all windows
-    predictions = np.zeros(T)
-    counts = np.zeros(T)
+    num_windows = (total_frames - window_size) // stride + 1
     
-    batch_inputs = []
-    batch_positions = []
+    print(f"running sliding window inference...")
+    print(f"  window size: {window_size}, stride: {stride}")
+    print(f"  total frames: {total_frames}, windows: {num_windows}")
+    
+    #predictions for each window (indexed by clip start)
+    window_probs = np.zeros(num_windows)
+    window_starts = np.zeros(num_windows, dtype=int)
+    
+    #process in batches
+    batch_clips = []
+    batch_features = []
+    batch_indices = []
     
     for i in tqdm(range(num_windows), desc="inference"):
         start = i * stride
-        end = start + window_size
         
-        #extract window
-        clip = frames[start:end]
-        edge_clip = edge_frames[start:end]
+        #load clip
+        clip = load_video_chunk(video_path, start, window_size)
+        if clip is None or len(clip) < window_size:
+            continue
         
-        #combine features
-        combined = create_combined_features(
-            clip[np.newaxis], edge_clip[np.newaxis]
-        )[0]
+        #compute edge features
+        features = np.array([process_frame_edges(f) for f in clip])
         
-        #transpose to (C, T, H, W)
-        combined = np.transpose(combined, (3, 0, 1, 2))
+        #prepare input
+        x = prepare_clip_input(clip, features)
         
-        batch_inputs.append(combined)
-        batch_positions.append((start, end))
+        batch_clips.append(x)
+        batch_indices.append(i)
+        window_starts[i] = start
         
         #process batch
-        if len(batch_inputs) >= batch_size or i == num_windows - 1:
-            batch_tensor = torch.tensor(np.array(batch_inputs), dtype=torch.float32)
-            batch_tensor = batch_tensor.to(device)
-            
-            with torch.no_grad():
-                outputs = model(batch_tensor)
-            
-            probs = outputs.cpu().numpy()
-            
-            #assign probabilities to frames
-            for prob, (s, e) in zip(probs, batch_positions):
-                #assign to end of window (prediction point)
-                predictions[e-1] += prob
-                counts[e-1] += 1
-            
-            batch_inputs = []
-            batch_positions = []
+        if len(batch_clips) >= batch_size or i == num_windows - 1:
+            if len(batch_clips) > 0:
+                batch_tensor = torch.tensor(np.array(batch_clips), dtype=torch.float32)
+                batch_tensor = batch_tensor.to(device)
+                
+                with torch.no_grad():
+                    probs = model.predict_proba(batch_tensor)
+                
+                probs = probs.cpu().numpy()
+                
+                for j, idx in enumerate(batch_indices):
+                    window_probs[idx] = probs[j]
+                
+                batch_clips = []
+                batch_indices = []
+    
+    #convert to per-frame predictions
+    #each window predicts bump at start + horizon
+    frame_predictions = np.zeros(total_frames)
+    frame_counts = np.zeros(total_frames)
+    
+    for i in range(num_windows):
+        predicted_bump_frame = window_starts[i] + horizon
+        if predicted_bump_frame < total_frames:
+            frame_predictions[predicted_bump_frame] += window_probs[i]
+            frame_counts[predicted_bump_frame] += 1
     
     #average overlapping predictions
-    mask = counts > 0
-    predictions[mask] /= counts[mask]
+    mask = frame_counts > 0
+    frame_predictions[mask] /= frame_counts[mask]
     
-    return predictions
+    return frame_predictions, window_probs, window_starts
 
 
-def detect_bumps_from_predictions(predictions, threshold=0.5):
+def non_maximum_suppression(predictions, threshold=None, window=None):
     """
-    convert frame-level predictions to bump detections
-    simple thresholding - any frame above threshold is a detection
+    apply temporal non-maximum suppression to predictions
+    
+    for high probability responses within a window, keep only the highest
+    
+    returns:
+        detected_frames: frame indices of detected bumps
+        confidences: confidence scores for detections
     """
-    #find all frames above threshold
-    above_threshold = predictions >= threshold
-    detected_frames = np.where(above_threshold)[0]
+    threshold = threshold or config.DETECTION_THRESHOLD
+    window = window or config.NMS_WINDOW
+    
+    #find frames above threshold
+    candidates = np.where(predictions >= threshold)[0]
+    
+    if len(candidates) == 0:
+        return np.array([]), np.array([])
+    
+    #sort by confidence (descending)
+    sorted_idx = np.argsort(predictions[candidates])[::-1]
+    candidates = candidates[sorted_idx]
+    
+    #apply NMS
+    keep = []
+    suppressed = set()
+    
+    for c in candidates:
+        if c in suppressed:
+            continue
+        
+        keep.append(c)
+        
+        #suppress nearby frames
+        for delta in range(-window, window + 1):
+            suppressed.add(c + delta)
+    
+    detected_frames = np.array(keep)
     confidences = predictions[detected_frames]
+    
+    #sort by frame index
+    sort_idx = np.argsort(detected_frames)
+    detected_frames = detected_frames[sort_idx]
+    confidences = confidences[sort_idx]
     
     return detected_frames, confidences
 
 
-def evaluate_detections(detected_frames, ground_truth_frames, 
-                        tolerance_frames=3, total_frames=None):
-    """
-    evaluate detection performance against ground truth
-    """
-    detected_set = set(detected_frames)
-    gt_set = set(ground_truth_frames)
+def evaluate_detections(detected_frames, ground_truth_frames,
+                        tolerance_frames=3):
+    """evaluate detection performance against ground truth"""
+    if len(detected_frames) == 0:
+        return {
+            'tp': 0, 'fp': 0, 'fn': len(ground_truth_frames),
+            'precision': 0, 'recall': 0, 'f1': 0,
+            'matched_detections': [], 'false_alarms': []
+        }
     
-    #true positives: detected bumps that match ground truth (within tolerance)
+    #match detections to ground truth
     tp = 0
     matched_gt = set()
     matched_det = set()
@@ -149,54 +230,91 @@ def evaluate_detections(detected_frames, ground_truth_frames,
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
     
     return {
-        'tp': tp,
-        'fp': fp,
-        'fn': fn,
-        'precision': precision,
-        'recall': recall,
-        'f1': f1,
+        'tp': tp, 'fp': fp, 'fn': fn,
+        'precision': precision, 'recall': recall, 'f1': f1,
         'matched_detections': list(matched_det),
         'false_alarms': list(set(detected_frames) - matched_det)
     }
 
 
-def plot_detection_results(predictions, detected_frames, ground_truth_frames=None,
-                          save_path=None, fps=15):
+def plot_detection_results(predictions, detected_frames, 
+                          ground_truth_frames=None, audio_candidates=None,
+                          save_path=None, fps=None):
     """
-    plot detection results over time
-    """
-    fig, axes = plt.subplots(2, 1, figsize=(15, 8), sharex=True)
+    generate bump detection plot (step 8)
     
+    x-axis: time
+    y-axis: model bump probability / thresholded detections
+    overlay: audio candidates, ground truth, detected bumps
+    """
+    fps = fps or config.TARGET_FPS
     time_axis = np.arange(len(predictions)) / fps
     
-    #plot predictions
-    axes[0].plot(time_axis, predictions, 'b-', alpha=0.7, label='bump probability')
-    axes[0].axhline(y=0.5, color='r', linestyle='--', alpha=0.5, label='threshold (0.5)')
-    axes[0].set_ylabel('probability')
+    fig, axes = plt.subplots(3, 1, figsize=(15, 10), sharex=True)
+    
+    #plot 1: raw predictions
+    axes[0].plot(time_axis, predictions, 'b-', alpha=0.7, linewidth=0.5)
+    axes[0].axhline(y=config.DETECTION_THRESHOLD, color='r', linestyle='--', 
+                    alpha=0.5, label=f'threshold ({config.DETECTION_THRESHOLD})')
+    axes[0].fill_between(time_axis, 0, predictions, alpha=0.3)
+    axes[0].set_ylabel('bump probability')
+    axes[0].set_ylim(0, 1)
     axes[0].legend()
-    axes[0].set_title('bump detection predictions')
+    axes[0].set_title('model predictions (sliding window)')
     
-    #plot detections
-    detection_signal = np.zeros(len(predictions))
+    #plot 2: detections vs ground truth
+    det_signal = np.zeros(len(predictions))
     for d in detected_frames:
-        if d < len(detection_signal):
-            detection_signal[d] = 1
+        if d < len(det_signal):
+            det_signal[d] = 1
     
-    axes[1].stem(time_axis, detection_signal, 'b-', markerfmt='bo', 
-                 basefmt='k-', label='detected bumps')
+    markerline, stemlines, baseline = axes[1].stem(
+        time_axis, det_signal, 'b-', markerfmt='bo', basefmt='k-'
+    )
+    stemlines.set_alpha(0.7)
+    markerline.set_markersize(4)
     
     if ground_truth_frames is not None:
         gt_signal = np.zeros(len(predictions))
         for g in ground_truth_frames:
             if g < len(gt_signal):
                 gt_signal[g] = 0.8
-        axes[1].stem(time_axis, gt_signal, 'g-', markerfmt='g^', 
-                     basefmt='k-', label='ground truth')
+        
+        markerline2, stemlines2, _ = axes[1].stem(
+            time_axis, gt_signal, 'g-', markerfmt='g^', basefmt='k-'
+        )
+        stemlines2.set_alpha(0.5)
+        markerline2.set_markersize(4)
+        axes[1].plot([], [], 'g^', label='ground truth')
     
-    axes[1].set_xlabel('time (s)')
-    axes[1].set_ylabel('bump')
+    axes[1].plot([], [], 'bo', label='detected')
+    axes[1].set_ylabel('detection')
+    axes[1].set_ylim(0, 1.2)
     axes[1].legend()
-    axes[1].set_title('detected vs ground truth bumps')
+    axes[1].set_title('detected bumps vs ground truth')
+    
+    #plot 3: audio candidates overlay
+    if audio_candidates is not None:
+        for c in audio_candidates:
+            t = c['audio_frame'] / fps
+            axes[2].axvline(x=t, color='orange', alpha=0.5, linewidth=1)
+            
+            #show window
+            window_times = c['window'] / fps
+            axes[2].axvspan(window_times.min(), window_times.max(), 
+                           alpha=0.1, color='orange')
+    
+    #overlay predictions
+    axes[2].plot(time_axis, predictions, 'b-', alpha=0.5, linewidth=0.5)
+    
+    #mark detections
+    for d in detected_frames:
+        if d < len(time_axis):
+            axes[2].axvline(x=time_axis[d], color='blue', alpha=0.7, linewidth=1)
+    
+    axes[2].set_xlabel('time (s)')
+    axes[2].set_ylabel('probability')
+    axes[2].set_title('audio candidates (orange) vs model detections (blue)')
     
     plt.tight_layout()
     
@@ -208,137 +326,134 @@ def plot_detection_results(predictions, detected_frames, ground_truth_frames=Non
     return fig
 
 
-def create_annotated_video(frames, predictions, detected_frames, 
-                          ground_truth_frames=None, output_path=None):
-    """
-    create video with bump detection overlay
-    """
+def create_annotated_video(video_path, predictions, detected_frames,
+                          ground_truth_frames=None, output_path=None,
+                          max_frames=None):
+    """create video with bump detection overlay"""
     if output_path is None:
         output_path = os.path.join(config.OUTPUT_DIR, 'annotated_video.mp4')
     
-    T, H, W, C = frames.shape
+    total_frames = get_frame_count(video_path)
+    if max_frames:
+        total_frames = min(total_frames, max_frames)
+    
+    #get video dimensions
+    cap = cv2.VideoCapture(video_path)
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
     
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, config.TARGET_FPS, (W, H + 60))
     
-    #convert sets for fast lookup
     detected_set = set(detected_frames)
     gt_set = set(ground_truth_frames) if ground_truth_frames is not None else set()
     
-    for t in tqdm(range(T), desc="creating annotated video"):
-        frame = frames[t].copy()
+    cap = cv2.VideoCapture(video_path)
+    
+    for t in tqdm(range(total_frames), desc="creating annotated video"):
+        ret, frame = cap.read()
+        if not ret:
+            break
         
-        #create info bar at bottom
+        #info bar
         info_bar = np.zeros((60, W, 3), dtype=np.uint8)
         
-        #draw prediction bar
+        #probability bar
         prob = predictions[t] if t < len(predictions) else 0
         bar_width = int(prob * (W - 20))
-        cv2.rectangle(info_bar, (10, 10), (10 + bar_width, 30), (0, 255, 0), -1)
+        color = (0, 255, 0) if prob < 0.5 else (0, 165, 255) if prob < 0.7 else (0, 0, 255)
+        cv2.rectangle(info_bar, (10, 10), (10 + bar_width, 30), color, -1)
         cv2.rectangle(info_bar, (10, 10), (W - 10, 30), (255, 255, 255), 1)
         
-        #add text
-        cv2.putText(info_bar, f"prob: {prob:.2f}", (10, 50), 
+        #text
+        cv2.putText(info_bar, f"P(bump): {prob:.2f}", (10, 50),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(info_bar, f"frame: {t}", (W - 100, 50),
+        cv2.putText(info_bar, f"frame: {t}", (W - 120, 50),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
-        #highlight bump detections
+        #detection highlight
         if t in detected_set:
-            #red border for detected bump
-            cv2.rectangle(frame, (0, 0), (W-1, H-1), (255, 0, 0), 3)
-            cv2.putText(frame, "BUMP DETECTED!", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+            cv2.rectangle(frame, (0, 0), (W-1, H-1), (0, 0, 255), 4)
+            cv2.putText(frame, "BUMP!", (10, 40),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
         
+        #ground truth indicator
         if t in gt_set:
-            #green indicator for ground truth
             cv2.circle(frame, (W - 30, 30), 15, (0, 255, 0), -1)
         
-        #combine frame and info bar
         combined = np.vstack([frame, info_bar])
-        bgr = cv2.cvtColor(combined, cv2.COLOR_RGB2BGR)
-        out.write(bgr)
+        out.write(combined)
     
+    cap.release()
     out.release()
     print(f"saved annotated video to {output_path}")
 
 
-def run_full_evaluation(video_path, model_path, model_type='simple', 
+def run_full_evaluation(video_path, model_path, model_type='unet',
                         ground_truth_path=None, max_frames=5000,
                         scaled_video_path=None):
     """
-    run complete evaluation pipeline on a video
-    
-    scaled_video_path: path to pre-scaled low-res video (skips scaling)
+    step 8: run complete inference and evaluation pipeline
     """
+    #use scaled video if available
+    eval_video = scaled_video_path if scaled_video_path else video_path
+    if scaled_video_path and os.path.exists(scaled_video_path):
+        print(f"using scaled video: {scaled_video_path}")
+    
     #load model
     print("loading model...")
     model, device = load_model(model_path, model_type)
     
-    #load or process video
-    if scaled_video_path and os.path.exists(scaled_video_path):
-        print(f"using pre-scaled video: {scaled_video_path}")
-        print(f"loading (max {max_frames} frames)...")
-        frames = load_scaled_video(scaled_video_path, max_frames=max_frames)
-    else:
-        scaled_path = os.path.join(config.OUTPUT_DIR, "scaled_video.mp4")
-        if os.path.exists(scaled_path):
-            print(f"loading scaled video (max {max_frames} frames)...")
-            frames = load_scaled_video(scaled_path, max_frames=max_frames)
-        else:
-            from video_scaler import scale_video
-            print("scaling video...")
-            scale_video(video_path, scaled_path)
-            frames = load_scaled_video(scaled_path, max_frames=max_frames)
-    
-    #process edges - all canny edges, no filtering
-    print("processing edges (all canny edges)...")
-    edge_frames = []
-    for frame in tqdm(frames, desc="extracting canny edges"):
-        edges = canny_edge_detection(frame)
-        edge_frames.append(edges)
-    edge_frames = np.array(edge_frames)
-    
     #run inference
-    predictions = sliding_window_inference(model, frames, edge_frames, device)
-    
-    #detect bumps
-    detected_frames, confidences = detect_bumps_from_predictions(
-        predictions, threshold=config.DETECTION_THRESHOLD
+    predictions, window_probs, window_starts = sliding_window_inference(
+        model, eval_video, device, max_frames=max_frames
     )
-    print(f"detected {len(detected_frames)} bumps (threshold={config.DETECTION_THRESHOLD})")
+    
+    #apply NMS
+    detected_frames, confidences = non_maximum_suppression(predictions)
+    print(f"detected {len(detected_frames)} bumps after NMS")
     
     #load ground truth if available
     gt_frames = None
+    audio_candidates = None
     if ground_truth_path and os.path.exists(ground_truth_path):
-        print("loading ground truth...")
+        print("loading ground truth/candidates...")
         gt = np.load(ground_truth_path, allow_pickle=True).item()
         
-        #adjust for fps difference
-        original_fps = gt['video_fps']
-        fps_ratio = config.TARGET_FPS / original_fps
-        gt_frames = (gt['bump_frames'] * fps_ratio).astype(int)
+        #check if this is new-style candidates or old-style ground truth
+        if 'candidates' in gt:
+            audio_candidates = gt['candidates']
+            #use audio bump frames as ground truth for evaluation
+            gt_frames = gt['bump_frames']
+        else:
+            gt_frames = gt.get('bump_frames', None)
+            if gt_frames is not None:
+                #adjust for fps difference
+                original_fps = gt['video_fps']
+                fps_ratio = config.TARGET_FPS / original_fps
+                gt_frames = (gt_frames * fps_ratio).astype(int)
         
         #evaluate
-        metrics = evaluate_detections(detected_frames, gt_frames, 
-                                      total_frames=len(frames))
-        print(f"\nevaluation metrics:")
-        print(f"  precision: {metrics['precision']:.4f}")
-        print(f"  recall: {metrics['recall']:.4f}")
-        print(f"  f1 score: {metrics['f1']:.4f}")
-        print(f"  true positives: {metrics['tp']}")
-        print(f"  false positives: {metrics['fp']}")
-        print(f"  false negatives: {metrics['fn']}")
+        if gt_frames is not None:
+            metrics = evaluate_detections(detected_frames, gt_frames)
+            print(f"\nevaluation metrics:")
+            print(f"  precision: {metrics['precision']:.4f}")
+            print(f"  recall: {metrics['recall']:.4f}")
+            print(f"  f1 score: {metrics['f1']:.4f}")
+            print(f"  true positives: {metrics['tp']}")
+            print(f"  false positives: {metrics['fp']}")
+            print(f"  false negatives: {metrics['fn']}")
     
     #plot results
     plot_path = os.path.join(config.OUTPUT_DIR, 'detection_results.png')
     plot_detection_results(predictions, detected_frames, gt_frames, 
-                          save_path=plot_path)
+                          audio_candidates, save_path=plot_path)
     
     #create annotated video
-    video_path = os.path.join(config.OUTPUT_DIR, 'annotated_video.mp4')
-    create_annotated_video(frames, predictions, detected_frames, 
-                          gt_frames, output_path=video_path)
+    video_out = os.path.join(config.OUTPUT_DIR, 'annotated_video.mp4')
+    create_annotated_video(eval_video, predictions, detected_frames,
+                          gt_frames, output_path=video_out, max_frames=max_frames)
     
     return predictions, detected_frames, gt_frames
 
@@ -347,19 +462,18 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser()
-    parser.add_argument('--video', type=str, 
-                       default=os.path.join(config.DATA_DIR, "PXL_20251118_131050616.TS.mp4"),
-                       help='path to original video (for scaling if needed)')
-    parser.add_argument('--scaled-video', type=str, default=None,
-                       help='path to pre-scaled low-res video (skips scaling)')
-    parser.add_argument('--model', type=str, 
-                       default=os.path.join(config.MODEL_DIR, "simple_best.pth"))
-    parser.add_argument('--model_type', type=str, default='simple',
-                       choices=['unet', 'simple', 'attention'])
+    parser.add_argument('--video', type=str,
+                       default=os.path.join(config.DATA_DIR, "PXL_20251118_131050616.TS.mp4"))
+    parser.add_argument('--scaled-video', type=str, default=None)
+    parser.add_argument('--model', type=str,
+                       default=os.path.join(config.MODEL_DIR, "resnet_gru_best.pth"))
+    parser.add_argument('--model_type', type=str, default='resnet_gru',
+                       choices=['resnet_gru', 'resnet_cnn', 'resnet_lstm',
+                                'efficientnet_gru', 'mobilenet_gru',
+                                'lightweight_gru', 'lightweight_cnn'])
     parser.add_argument('--ground_truth', type=str,
-                       default=os.path.join(config.OUTPUT_DIR, "ground_truth.npy"))
-    parser.add_argument('--max-frames', type=int, default=5000,
-                       help='max frames to evaluate')
+                       default=os.path.join(config.OUTPUT_DIR, "bump_candidates.npy"))
+    parser.add_argument('--max-frames', type=int, default=5000)
     args = parser.parse_args()
     
     run_full_evaluation(
@@ -370,4 +484,3 @@ if __name__ == "__main__":
         max_frames=args.max_frames,
         scaled_video_path=args.scaled_video
     )
-

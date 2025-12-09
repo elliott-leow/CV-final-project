@@ -1,5 +1,5 @@
-#video scaling pipeline with edge preservation using ffmpeg
-#downscales to 240p at 15fps while maintaining sharp edges
+#step 0: video scaling pipeline with edge preservation
+#downscales to 240p at 15fps while preserving edges
 
 import cv2
 import numpy as np
@@ -37,13 +37,33 @@ def get_video_info(input_path):
         return None
 
 
-def scale_video_ffmpeg(input_path, output_path, target_width, target_height, target_fps):
-    """scale video using ffmpeg with high quality settings"""
+def scale_video_ffmpeg(input_path, output_path, target_width, target_height, target_fps,
+                       keep_audio=True):
+    """
+    scale video using ffmpeg with edge-preserving settings
+    - fps conversion
+    - mild lowpass before downscale (prevents aliasing)
+    - lanczos resampling
+    - mild sharpening to boost edges
+    """
+    #build filter chain for edge preservation
+    #1. fps conversion
+    #2. convert to linear light for better edge handling (approximation via curves)
+    #3. mild gaussian blur to remove detail below target resolution
+    #4. lanczos downscale
+    #5. mild unsharp mask to boost edges without halos
+    
+    sharpen_luma = config.SHARPEN_AMOUNT
+    sharpen_radius = config.SHARPEN_RADIUS
+    
     filter_chain = (
         f"fps={target_fps},"
+        f"gblur=sigma={config.LOWPASS_SIGMA},"
         f"scale={target_width}:{target_height}:flags=lanczos,"
-        f"unsharp=5:5:0.5:5:5:0.0"
+        f"unsharp={sharpen_radius}:{sharpen_radius}:{sharpen_luma}:{sharpen_radius}:{sharpen_radius}:0"
     )
+    
+    audio_opts = ['-c:a', 'aac', '-b:a', '128k'] if keep_audio else ['-an']
     
     cmd = [
         'ffmpeg', '-y',
@@ -51,12 +71,16 @@ def scale_video_ffmpeg(input_path, output_path, target_width, target_height, tar
         '-vf', filter_chain,
         '-c:v', 'libx264',
         '-preset', 'fast',
-        '-crf', '18',
-        '-an',
+        '-crf', '18',  #high quality
+        *audio_opts,
         output_path
     ]
     
-    print(f"running ffmpeg: {' '.join(cmd)}")
+    print(f"running ffmpeg with edge-preserving pipeline...")
+    print(f"  lowpass sigma: {config.LOWPASS_SIGMA}")
+    print(f"  resampling: lanczos")
+    print(f"  sharpening: {sharpen_luma} (radius {sharpen_radius})")
+    
     result = subprocess.run(cmd, capture_output=True, text=True)
     
     if result.returncode != 0:
@@ -66,14 +90,22 @@ def scale_video_ffmpeg(input_path, output_path, target_width, target_height, tar
     return True
 
 
-def scale_video_ffmpeg_gpu(input_path, output_path, target_width, target_height, target_fps):
-    """scale video using ffmpeg with nvidia gpu acceleration"""
+def scale_video_ffmpeg_gpu(input_path, output_path, target_width, target_height, target_fps,
+                           keep_audio=True):
+    """scale video using ffmpeg with gpu acceleration if available"""
+    sharpen_luma = config.SHARPEN_AMOUNT
+    sharpen_radius = config.SHARPEN_RADIUS
+    
     filter_chain = (
         f"fps={target_fps},"
+        f"gblur=sigma={config.LOWPASS_SIGMA},"
         f"scale={target_width}:{target_height}:flags=lanczos,"
-        f"unsharp=5:5:0.5:5:5:0.0"
+        f"unsharp={sharpen_radius}:{sharpen_radius}:{sharpen_luma}:{sharpen_radius}:{sharpen_radius}:0"
     )
     
+    audio_opts = ['-c:a', 'aac', '-b:a', '128k'] if keep_audio else ['-an']
+    
+    #try nvenc
     cmd = [
         'ffmpeg', '-y',
         '-hwaccel', 'cuda',
@@ -82,7 +114,7 @@ def scale_video_ffmpeg_gpu(input_path, output_path, target_width, target_height,
         '-c:v', 'h264_nvenc',
         '-preset', 'p4',
         '-cq', '18',
-        '-an',
+        *audio_opts,
         output_path
     ]
     
@@ -93,6 +125,7 @@ def scale_video_ffmpeg_gpu(input_path, output_path, target_width, target_height,
         print("gpu encoding successful")
         return True
     
+    #try qsv
     print("nvenc failed, trying intel qsv...")
     cmd = [
         'ffmpeg', '-y',
@@ -102,7 +135,7 @@ def scale_video_ffmpeg_gpu(input_path, output_path, target_width, target_height,
         '-c:v', 'h264_qsv',
         '-preset', 'fast',
         '-global_quality', '18',
-        '-an',
+        *audio_opts,
         output_path
     ]
     
@@ -113,15 +146,19 @@ def scale_video_ffmpeg_gpu(input_path, output_path, target_width, target_height,
         return True
     
     print("gpu encoding failed, falling back to cpu...")
-    return scale_video_ffmpeg(input_path, output_path, target_width, target_height, target_fps)
+    return scale_video_ffmpeg(input_path, output_path, target_width, target_height, 
+                              target_fps, keep_audio)
 
 
 def scale_video(input_path, output_path=None, 
                 target_width=None, target_height=None, target_fps=None,
-                use_gpu=True):
+                use_gpu=True, keep_audio=True):
     """
-    main function to scale video with edge preservation
-    returns frame count and output path (does NOT load frames into memory)
+    step 0: scale video with edge preservation
+    - lowpass filter before downscale
+    - lanczos resampling
+    - mild sharpening after downscale
+    returns frame count and output path
     """
     target_width = target_width or config.TARGET_WIDTH
     target_height = target_height or config.TARGET_HEIGHT
@@ -140,16 +177,17 @@ def scale_video(input_path, output_path=None,
         raise RuntimeError("ffmpeg not found")
     
     if use_gpu:
-        success = scale_video_ffmpeg_gpu(input_path, output_path, target_width, target_height, target_fps)
+        success = scale_video_ffmpeg_gpu(input_path, output_path, target_width, target_height, 
+                                         target_fps, keep_audio)
     else:
-        success = scale_video_ffmpeg(input_path, output_path, target_width, target_height, target_fps)
+        success = scale_video_ffmpeg(input_path, output_path, target_width, target_height, 
+                                     target_fps, keep_audio)
     
     if not success:
         raise RuntimeError("video scaling failed")
     
     print(f"saved scaled video to {output_path}")
     
-    #get frame count without loading
     frame_count = get_frame_count(output_path)
     print(f"scaled video has {frame_count} frames")
     
@@ -162,6 +200,14 @@ def get_frame_count(video_path):
     count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
     return count
+
+
+def get_video_fps(video_path):
+    """get video fps"""
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+    return fps
 
 
 def load_video_chunk(video_path, start_frame, num_frames):
@@ -181,10 +227,17 @@ def load_video_chunk(video_path, start_frame, num_frames):
     return np.array(frames) if frames else None
 
 
+def frame_to_luma(frame):
+    """convert rgb frame to luma (Y from YUV)"""
+    if len(frame.shape) == 3:
+        #bt.709 luma coefficients
+        return 0.2126 * frame[:,:,0] + 0.7152 * frame[:,:,1] + 0.0722 * frame[:,:,2]
+    return frame
+
+
 def iter_video_frames(video_path, batch_size=100):
     """generator that yields batches of frames"""
     cap = cv2.VideoCapture(video_path)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
     batch = []
     frame_idx = 0
