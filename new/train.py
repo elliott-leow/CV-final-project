@@ -115,9 +115,17 @@ def e_step(model, pos_clips, pos_features, pos_info, device, temperature=1.0,
     return weights
 
 
+def bce_loss(pred, target):
+    """standard binary cross-entropy loss"""
+    eps = 1e-7
+    pred = torch.clamp(pred, eps, 1 - eps)
+    loss = -target * torch.log(pred) - (1 - target) * torch.log(1 - pred)
+    return loss.mean()
+
+
 def m_step_loss(pred, target, weight, lambda_neg=1.0):
     """
-    step 7: compute weighted cross-entropy loss
+    step 7: compute weighted cross-entropy loss (legacy, not used by default)
     
     L_pos = -sum_k sum_t w_{k,t} * log p_θ(y=1|C_{k,t})
     L_neg = -λ * sum_u log(1 - p_θ(y=1|C_u^neg))
@@ -174,7 +182,7 @@ class FocalLoss(nn.Module):
 
 
 def train_epoch_em(model, loader, optimizer, device, lambda_neg=1.0, grad_clip=None):
-    """train one epoch with weighted loss"""
+    """train one epoch with standard BCE loss"""
     model.train()
     total_loss = 0
     all_preds = []
@@ -184,15 +192,14 @@ def train_epoch_em(model, loader, optimizer, device, lambda_neg=1.0, grad_clip=N
     for batch_x, batch_y, batch_w in pbar:
         batch_x = batch_x.to(device)
         batch_y = batch_y.to(device)
-        batch_w = batch_w.to(device)
         
         optimizer.zero_grad()
         
         #get probabilities
         probs = model.predict_proba(batch_x)
         
-        #weighted loss
-        loss = m_step_loss(probs, batch_y, batch_w, lambda_neg)
+        #standard BCE loss
+        loss = bce_loss(probs, batch_y)
         
         loss.backward()
         
@@ -225,10 +232,9 @@ def evaluate_em(model, loader, device, lambda_neg=1.0):
         for batch_x, batch_y, batch_w in tqdm(loader, desc="evaluating", leave=False):
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
-            batch_w = batch_w.to(device)
             
             probs = model.predict_proba(batch_x)
-            loss = m_step_loss(probs, batch_y, batch_w, lambda_neg)
+            loss = bce_loss(probs, batch_y)
             
             total_loss += loss.item()
             all_preds.extend(probs.cpu().numpy())
