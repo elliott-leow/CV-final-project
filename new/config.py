@@ -65,6 +65,7 @@ EM_ITERATIONS = 1  #number of E-M cycles (1 = no EM, just prior weights)
 EM_EPOCHS_PER_M_STEP = 3  #epochs per M-step
 LAMBDA_NEG = 1.0  #weight for negative class in loss
 RESPONSIBILITY_TEMPERATURE = 1.0  #temperature for softmax in E-step
+EM_WEIGHT_MOMENTUM = 0.5  #blend old/new weights (0=new only, higher=smoother)
 
 #inference parameters (step 8)
 DETECTION_THRESHOLD = 0.7

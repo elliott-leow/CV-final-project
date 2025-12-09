@@ -52,13 +52,16 @@ class EMBumpDataset(Dataset):
                 torch.tensor(self.weights[idx]))
 
 
-def e_step(model, pos_clips, pos_features, pos_info, device, temperature=1.0):
+def e_step(model, pos_clips, pos_features, pos_info, device, temperature=1.0,
+           old_weights=None, momentum=0.5):
     """
     step 6: e-step - compute soft assignment of true bump frame for each audio event
     
     for each candidate k and each possible bump frame t in T_k:
         w_{k,t} ∝ π_k(t) * p_θ(y=1|C_{k,t})
     normalize so sum over t = 1 for each k
+    
+    momentum: blend factor for old weights (0=use new, 1=keep old)
     
     returns: updated weights array
     """
@@ -104,6 +107,10 @@ def e_step(model, pos_clips, pos_features, pos_info, device, temperature=1.0):
             #assign to weight array
             for i, idx in enumerate(indices):
                 weights[idx] = responsibilities[i]
+    
+    #blend with old weights if provided (smoothing)
+    if old_weights is not None and momentum > 0:
+        weights = momentum * old_weights + (1 - momentum) * weights
     
     return weights
 
@@ -310,9 +317,12 @@ def train_em(model_type='unet', em_iterations=None, epochs_per_m=None,
         #e-step: update responsibilities (skip first iteration, use priors)
         if em_iter > 0:
             print("\nE-STEP: computing responsibilities...")
+            old_pos_weights = all_weights[:len(pos_clips)].copy()
             new_pos_weights = e_step(
                 model, pos_clips, pos_features, pos_info, device,
-                temperature=config.RESPONSIBILITY_TEMPERATURE
+                temperature=config.RESPONSIBILITY_TEMPERATURE,
+                old_weights=old_pos_weights,
+                momentum=config.EM_WEIGHT_MOMENTUM
             )
             
             #update weights for positives
