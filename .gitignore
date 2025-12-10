@@ -1,8 +1,7 @@
 /data
 /data-scaled
+/models
 /output
-/new/output
-/new/training_data
-/new/data
+/training_data
 *.joblib
 *.pkl
